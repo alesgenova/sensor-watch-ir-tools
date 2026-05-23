@@ -1,0 +1,9 @@
+.pio/
+.pioenvs/
+.piolibdeps/
+.vscode/
+.idea/
+__pycache__/
+*.swp
+*.swo
+.venv*/
