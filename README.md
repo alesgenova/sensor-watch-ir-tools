@@ -99,7 +99,7 @@ Pins to use on the MCU with the provided modem firmware:
 |-------------|---------|----------|
 | VCC         | 5V      | 3.3V     |
 | TX (IR LED) | D9      | D1       |
-| RX (PT)     | D8      | D8       |
+| RX (PT)     | A0 (default) or D8 (digital-rx)    | D8       |
 
 
 <p>
@@ -184,6 +184,11 @@ a corrupted ACK simply fails to match and the frame is retried, while a matching
 proof the frame arrived intact (the watch only ACKs *after* the frame passed its own
 CRC). On the weak watch → host path the watch can repeat the id several times per ACK
 (the `Acnt` knob); the host scans a small sliding window for any intact copy.
+
+### Analog vs Digital RX
+
+Analog RX (default) samples the phototransistor with the ADC and decodes it with a self-tuning slicer. This a less elegant implementation, but it proved to just work better: it works in wider range of ambient lighting conditions.
+The original Digital RX implementation can be used with the `--digital-rx` option. This mode detects edges on the raw pin: it's potentially faster but it actually behaves worse with the low intensity signal that is received from the watch.
 
 ### Flasher logic flow
 

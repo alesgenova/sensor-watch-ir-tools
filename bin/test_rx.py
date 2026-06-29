@@ -26,7 +26,8 @@ import sys
 import time
 
 from ir_modem import (Modem, handshake, HANDSHAKE_BAUD, RESET_DELAY_S,
-                     CMD_RX, CMD_STOP, MSG_OK, MSG_RX, MSG_ERR, MSG_RX_STATUS)
+                     CMD_RX, CMD_STOP, MSG_OK, MSG_RX, MSG_ERR, MSG_RX_STATUS,
+                     MSG_RX_TUNE, RX_DIGITAL, RX_ANALOG)
 from serial_frame import FrameParser
 
 try:
@@ -73,6 +74,12 @@ def main():
                    help="RX baud rate, 50..9600. Default: 300 (matches ir_tx_face)")
     p.add_argument('--encoding', choices=['irda', 'nrz'], default='nrz',
                    help="Line encoding. Default: nrz")
+    p.add_argument('--digital-rx', action='store_true',
+                   help="Use digital edge-detection RX instead of the default "
+                        "analog polled RX (for strong, clean signals).")
+    p.add_argument('--analog-rx-debug', action='store_true',
+                   help="In analog RX mode (the default), print the [rx-tune] "
+                        "data-slicer diagnostics. Off by default (quiet).")
     p.add_argument('--mode', choices=['frame', 'raw'], default='frame',
                    help="frame: parse + validate framed payloads (with stats). "
                         "raw: dump every decoded byte (to --raw-output, or "
@@ -108,13 +115,15 @@ def main():
 
     # PING + CONFIG, then enter RX. We only ever receive, so tx_baud is moot;
     # pass the rx baud for both (the modem only uses tx_baud on a CMD_TX).
-    handshake(modem, args.baud, args.baud, args.encoding)
+    handshake(modem, args.baud, args.baud, args.encoding,
+              RX_DIGITAL if args.digital_rx else RX_ANALOG)
     modem.send(CMD_RX)
     msg = modem.read_message(time.time() + 3.0)
     if not msg or msg[0] != MSG_OK:
         sys.exit(f"error: modem did not enter RX (got {msg!r})")
 
     print(f"listening: baud={args.baud} encoding={args.encoding} "
+          f"rx={'digital' if args.digital_rx else 'analog'} "
           f"mode={args.mode}; Ctrl-C to stop.", file=sys.stderr)
 
     if args.mode == 'raw':
@@ -129,6 +138,21 @@ def _print_rx_status(payload):
         ferr   = payload[0] | (payload[1] << 8)
         bufovf = payload[2] | (payload[3] << 8)
         print(f"[rx-status] ferr={ferr} bufovf={bufovf}", file=sys.stderr, flush=True)
+
+
+def _print_rx_tune(payload):
+    """DIAGNOSTIC: surface the analog RX data-slicer state (envelopes/threshold)."""
+    if len(payload) >= 12:
+        dark  = payload[0] | (payload[1] << 8)   # high (dark) envelope
+        light = payload[2] | (payload[3] << 8)   # low (light) envelope
+        span  = payload[4] | (payload[5] << 8)   # live envelope span (dark - light)
+        thr   = payload[6] | (payload[7] << 8)   # slice midpoint
+        mc    = payload[8] | (payload[9] << 8)   # squelch floor
+        ovs   = payload[10]
+        locked = bool(payload[11] & 1)
+        print(f"[rx-tune] dark={dark} light={light} span={span} thr={thr} "
+              f"min_contrast={mc} oversample={ovs}x "
+              f"{'LOCKED' if locked else 'squelched'}", file=sys.stderr, flush=True)
 
 
 def _stream_raw(args):
@@ -149,6 +173,9 @@ def _stream_raw(args):
                 sys.stdout.flush()
         elif mtype == MSG_RX_STATUS:
             _print_rx_status(payload)
+        elif mtype == MSG_RX_TUNE:
+            if args.analog_rx_debug:
+                _print_rx_tune(payload)
         elif mtype == MSG_ERR:
             code = payload[0] if payload else 0
             print(f"modem error code {code}", file=sys.stderr)
@@ -170,6 +197,9 @@ def _stream_frames(args):
                           f"{f.payload.hex(' ')}", flush=True)
             elif mtype == MSG_RX_STATUS:
                 _print_rx_status(payload)
+            elif mtype == MSG_RX_TUNE:
+                if args.analog_rx_debug:
+                    _print_rx_tune(payload)
             elif mtype == MSG_ERR:
                 code = payload[0] if payload else 0
                 print(f"modem error code {code}", file=sys.stderr)

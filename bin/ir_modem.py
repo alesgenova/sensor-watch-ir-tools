@@ -11,7 +11,9 @@ USB protocol (fixed 115200, decoupled from the IR baud):
     framing (both directions):  [SOF=0xA5][TYPE][LEN_LO][LEN_HI][payload]
 
     host -> modem:
-        CMD_CONFIG 0x01   payload = tx_baud(4 LE) rx_baud(4 LE) enc(1)
+        CMD_CONFIG 0x01   payload = tx_baud(4 LE) rx_baud(4 LE) enc(1) rx_mode(1)
+                          rx_mode: 0 = digital edge RX, 1 = analog polled RX
+                          (analog is XIAO SAMD21 only; the UNO ignores it).
         CMD_TX     0x02   payload = tx_flags(1) + frame bytes
                           tx_flags bit0 AUTO_RX: flip to RX after sending
                           (else fire-and-forget). The modem holds no ACK policy.
@@ -24,6 +26,8 @@ USB protocol (fixed 115200, decoupled from the IR baud):
         MSG_OK     0x12
         MSG_ERR    0x13   payload = code(1)
         MSG_PONG   0x15   payload = proto_version(1)
+        MSG_RX_TUNE 0x16  DIAGNOSTIC (analog RX): lvl_dark(2) lvl_light(2)
+                          noise(2) thr(2) min_contrast(2) oversample(1) flags(1)
 """
 
 import struct
@@ -49,11 +53,17 @@ MSG_OK        = 0x12
 MSG_ERR       = 0x13
 MSG_RX_STATUS = 0x14   # DIAGNOSTIC (samd21 modem): ferr(2 LE) bufovf(2 LE)
 MSG_PONG      = 0x15
-MODEM_PROTO_VERSION = 1
+MSG_RX_TUNE   = 0x16   # DIAGNOSTIC (analog RX): autotune levels (see docstring)
+MODEM_PROTO_VERSION = 2
 
 # Encoding selector (matches the watch / firmware ENC_NRZ / ENC_IRDA).
 ENC_NRZ  = 0
 ENC_IRDA = 1
+
+# RX front-end selector (matches the firmware RxMode). Analog polled RX is the
+# XIAO SAMD21's weak-light path; the UNO is digital-only and ignores this.
+RX_DIGITAL = 0
+RX_ANALOG  = 1
 
 # Serial defaults. The UNO modem auto-resets when the port is opened; the
 # bootloader takes ~2s before the sketch runs, so callers wait RESET_DELAY_S.
@@ -101,10 +111,12 @@ class Modem:
             self._read_into_buf(deadline)
 
 
-def handshake(modem: Modem, tx_baud: int, rx_baud: int, encoding: str):
+def handshake(modem: Modem, tx_baud: int, rx_baud: int, encoding: str,
+              rx_mode: int = RX_ANALOG):
     """PING/PONG to confirm the modem is alive + the right version, then CONFIG
-    it with tx/rx baud and encoding. Exits on failure. Receive-only callers can
-    pass any valid tx_baud (the modem only uses it on a CMD_TX)."""
+    it with tx/rx baud, encoding, and RX front-end mode. Exits on failure.
+    Receive-only callers can pass any valid tx_baud (the modem only uses it on a
+    CMD_TX). rx_mode selects analog polled RX (default) or digital edge RX."""
     modem.send(CMD_PING)
     msg = modem.read_message(time.time() + 3.0)
     if not msg or msg[0] != MSG_PONG:
@@ -112,7 +124,7 @@ def handshake(modem: Modem, tx_baud: int, rx_baud: int, encoding: str):
     ver = msg[1][0] if msg[1] else 0
     if ver != MODEM_PROTO_VERSION:
         sys.exit(f"error: modem proto version {ver}, expected {MODEM_PROTO_VERSION}")
-    cfg = struct.pack('<IIB', tx_baud, rx_baud, enc_byte(encoding))
+    cfg = struct.pack('<IIBB', tx_baud, rx_baud, enc_byte(encoding), rx_mode & 0xFF)
     modem.send(CMD_CONFIG, cfg)
     msg = modem.read_message(time.time() + 3.0)
     if not msg or msg[0] != MSG_OK:

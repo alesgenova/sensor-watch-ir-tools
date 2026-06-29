@@ -40,6 +40,19 @@
 // header. In brief: CMD_TX(flags,frame) transmits; TX_FLAG_AUTO_RX flips to RX
 // before reporting MSG_TX_DONE; CMD_RX enters RX; CMD_STOP idles.
 //   USB framing (both directions): [SOF=0xA5][TYPE][LEN_LO][LEN_HI][payload]
+//
+// DUAL-MODE RX. CMD_CONFIG's rx_mode byte selects the RX front-end:
+//   * RX_DIGITAL (0, default): the edge detector described above (EIC falling-edge
+//     ISR + TC bit sampling). Needs the light to swing the pin across a clean
+//     digital threshold.
+//   * RX_ANALOG  (1): a polled-ADC software UART. The ADC free-runs on PA07/AIN7
+//     and TC4 ticks an auto-selected RX_OVERSAMPLE samples/bit; each sample is
+//     thresholded against an ADAPTIVELY LEARNED dark/light pair (bootstrapped
+//     from the guaranteed light start bit + dark stop bit of every frame) and fed
+//     to an oversampling receiver. This recovers data when the received light is
+//     too weak for a digital transition. It self-tunes (no user parameters) and
+//     squelches noise via a measured min-contrast floor. Host flag: --analog-rx.
+//     TX is shared and unchanged. See the ANALOG RX section below.
 
 #include <Arduino.h>
 #include <string.h>
@@ -95,11 +108,11 @@ static inline uint16_t baud_to_rx_ticks(uint32_t baud) {
 
 #define USB_BAUD    115200
 #define USB_SOF     0xA5
-#define MODEM_PROTO_VERSION 1
+#define MODEM_PROTO_VERSION 2
 
 // host -> modem
 enum : uint8_t {
-    CMD_CONFIG = 0x01,   // payload: tx_baud(4 LE) rx_baud(4 LE) enc(1)
+    CMD_CONFIG = 0x01,   // payload: tx_baud(4 LE) rx_baud(4 LE) enc(1) rx_mode(1)
     CMD_TX     = 0x02,   // payload: tx_flags(1) then the frame bytes to transmit
     CMD_RX     = 0x03,   // no payload: enter RX (listen) -> MSG_OK, then MSG_RX stream
     CMD_STOP   = 0x04,   // stop RX, go idle
@@ -117,6 +130,8 @@ enum : uint8_t {
     MSG_ERR       = 0x13,  // payload: error code(1)
     MSG_RX_STATUS = 0x14,  // DIAGNOSTIC: ferr(2 LE) bufovf(2 LE), this RX session
     MSG_PONG      = 0x15,  // payload: proto_version(1)
+    MSG_RX_TUNE   = 0x16,  // DIAGNOSTIC (analog RX): lvl_dark(2) lvl_light(2)
+                           // noise(2) thr(2) min_contrast(2) oversample(1) flags(1)
 };
 enum : uint8_t {
     ERR_BAD_LEN  = 1,
@@ -138,6 +153,10 @@ static uint32_t g_tx_baud  = 3600;       // main-context only (enter_tx)
 static uint32_t g_rx_baud  = 150;        // main-context only (enter_rx)
 static volatile Encoding g_encoding = ENC_IRDA;   // read in the TC4 ISR
 static bool     g_configured = false;
+
+// RX front-end selector (CMD_CONFIG rx_mode byte). Read in the TC4 ISR + enter_rx.
+enum RxMode : uint8_t { RX_DIGITAL = 0, RX_ANALOG = 1 };
+static volatile RxMode g_rx_mode = RX_DIGITAL;
 
 enum Dir : uint8_t { DIR_IDLE = 0, DIR_TX = 1, DIR_RX = 2 };
 static volatile Dir g_dir = DIR_IDLE;
@@ -261,6 +280,246 @@ static void tc4_clock_once(void) {
     while (GCLK->STATUS.bit.SYNCBUSY) {}
 }
 
+// ===========================================================================
+// ANALOG RX front-end (g_rx_mode == RX_ANALOG).
+//
+// The ADC free-runs on PA07/AIN7; TC4 ticks a_oversample samples/bit and its ISR
+// feeds each sample to a_process_sample(). A DATA SLICER (a_track_env) keeps a
+// peak (dark) and valley (light) envelope of the signal and slices at their
+// midpoint; a_classify turns each sample into a logical bit and an oversampling
+// UART receiver assembles frames. The envelopes attack fast / decay slow, so they
+// self-calibrate amplitude and follow ambient drift but can't be dragged into the
+// signal (the failure mode of the earlier EMA estimator). A fixed min-contrast
+// (envelope span) floor squelches noise. Reliability guards: an idle-before-start
+// arm gate, a saturation timeout, and per-frame contrast validation.
+// ===========================================================================
+
+// Tunables -- all self-scaling; no user parameters reach here.
+#define A_OVERSAMPLE_MAX   32u
+#define A_OVERSAMPLE_MIN    8u
+#define A_ADC_CEIL_SPS  60000u   // ~ADC throughput with the long sample time below
+#define A_ADC_SAMPLEN      31u   // ADC SAMPCTRL: long S/H for the 100k high-Z source
+
+// Data slicer (peak/valley envelope detectors). The dark level is the HIGH
+// envelope and the light level the LOW envelope of the signal; the slice
+// threshold is their midpoint. Each envelope ATTACKS fast toward a new extreme
+// and otherwise DECAYS toward the live sample (so the rate is proportional to how
+// far it is from the signal -- a big DC/ambient shift, e.g. the pedestal that
+// appears when a transmission starts, is closed quickly; small wobble is ignored).
+// Decaying toward the SIGNAL (not toward the other envelope) is what makes onset
+// re-acquisition fast; the constant is slower in-frame (to ride out a run of one
+// symbol that leaves a rail untouched for ~10 bits) and faster while idle (to snap
+// to a new DC and to squelch between frames). Envelopes can't be dragged into the
+// signal by its own excursions (the bug that collapsed the old estimator). Kept in
+// Q6 fixed point so the decay has sub-count resolution.
+#define A_ENV_Q             6u   // envelope fixed-point fractional bits
+#define A_ATK_SHIFT         2u   // attack toward a new extreme (~1/4 of the gap per sample)
+#define A_DECAY_FRAME      11u   // in-frame decay toward the signal (~2048-sample TC)
+#define A_DECAY_IDLE        7u   // idle decay (fast DC re-acquire / squelch, ~128-sample TC)
+#define A_MIN_CONTRAST     60u   // squelch: need >= this envelope span to call it data
+#define A_HYST_SHIFT        2u   // classify hysteresis = span >> 2 around the midpoint
+
+// NRZ bit-decision sample point, as a fraction of the bit. Both optical edges are
+// RC-limited and SYMMETRIC (measured: rise ~= fall), and each transition sits at
+// the START of its cell, so the settled region is roughly [edge_frac, 1.0]. Sample
+// past the transition but with margin before the next cell boundary: 2/3 centres
+// us in that window for baud where the edge is < ~half a bit (i.e. run the link
+// slow enough -- ~100-150 baud for a 100k pull-up -- that this holds).
+#define A_NRZ_SAMPLE_NUM    2u
+#define A_NRZ_SAMPLE_DEN    3u
+
+#define A_ARM_BITS          1u   // bit-times of clean dark needed to (re)arm a start
+#define A_SAT_BITS         15u   // light longer than this many bits => saturation
+
+// Envelopes (Q6 ADC counts) and the levels/thresholds derived from them.
+static volatile int32_t  a_env_hi_q     = 2048 << A_ENV_Q;  // dark / high envelope
+static volatile int32_t  a_env_lo_q     = 2048 << A_ENV_Q;  // light / low envelope
+static volatile uint16_t a_lvl_dark     = 2048;   // = a_env_hi_q >> Q (for diagnostics)
+static volatile uint16_t a_lvl_light    = 2048;   // = a_env_lo_q >> Q
+static volatile uint16_t a_min_contrast = A_MIN_CONTRAST;   // fixed squelch floor
+static volatile uint16_t a_thr_lo       = 0;      // adc <  a_thr_lo -> light
+static volatile uint16_t a_thr_hi       = 0;      // adc >  a_thr_hi -> dark (hysteresis)
+static volatile uint16_t a_thr_dec      = 0;      // bit-decision threshold (= midpoint)
+static volatile bool     a_line_light   = false;  // hysteretic logical line state
+
+// Receiver FSM (reuses RxState ST_IDLE / ST_RECEIVING).
+static volatile uint8_t  a_oversample   = A_OVERSAMPLE_MIN;
+static volatile uint8_t  a_samp_in_bit  = 0;
+static volatile uint8_t  a_bit_index    = 0;      // 0=start, 1..8=data, 9=stop
+static volatile uint8_t  a_byte_data    = 0;
+static volatile bool     a_armed        = false;
+static volatile uint16_t a_idle_dark    = 0;      // consecutive dark idle samples
+static volatile uint16_t a_light_run    = 0;      // consecutive light samples (sat. guard)
+static volatile uint16_t a_bit_lvl      = 0;      // NRZ: ADC at the settled sample point
+static volatile bool     a_bit_pulse    = false;  // IrDA: light pulse seen in 1st half
+static volatile uint16_t a_frame_lmin   = 0;      // lightest ADC this frame
+static volatile uint16_t a_frame_dmax   = 0;      // darkest ADC this frame
+static volatile RxState  a_state        = ST_IDLE;
+
+// --- ADC, free-running on PA07 / AIN7 ---
+static inline void adc_sync(void) { while (ADC->STATUS.bit.SYNCBUSY) {} }
+
+static void adc_start_freerun(void) {
+    // Let the core load calibration, set the reference, route PA07's pinmux to
+    // analog, and point INPUTCTRL.MUXPOS at AIN7 (D8 == ADC channel 7).
+    analogReadResolution(12);
+    (void)analogRead(PT_ARDUINO_PIN);
+
+    ADC->CTRLA.bit.ENABLE = 0; adc_sync();
+    // Long sample time for the high-impedance 100k source; FREERUN so RESULT
+    // always holds the latest conversion (the tick ISR just reads it).
+    ADC->SAMPCTRL.reg = A_ADC_SAMPLEN;
+    ADC->CTRLB.reg = ADC_CTRLB_PRESCALER_DIV16
+                   | ADC_CTRLB_RESSEL_12BIT
+                   | ADC_CTRLB_FREERUN;
+    adc_sync();
+    ADC->CTRLA.bit.ENABLE = 1; adc_sync();
+    ADC->SWTRIG.bit.START = 1;
+}
+
+static void adc_stop(void) {
+    ADC->CTRLA.bit.ENABLE = 0; adc_sync();
+    ADC->CTRLB.bit.FREERUN = 0; adc_sync();
+}
+
+// Advance the peak/valley envelopes with one sample, then re-derive the slice
+// thresholds. Runs on EVERY sample (idle and in-frame) so the envelopes always
+// reflect the live signal. Fast attack to each rail; slow symmetric decay toward
+// the midpoint so they follow DC drift and recover from transients.
+static inline void a_track_env(uint16_t adc) {
+    int32_t s = (int32_t)adc << A_ENV_Q;
+    // Slower decay inside a frame (protect symbol runs), faster while idle.
+    uint8_t dk = (a_state == ST_RECEIVING) ? A_DECAY_FRAME : A_DECAY_IDLE;
+    // Each envelope: attack toward a new extreme, else decay toward the sample.
+    a_env_hi_q += (s - a_env_hi_q) >> ((s > a_env_hi_q) ? A_ATK_SHIFT : dk);
+    a_env_lo_q += (s - a_env_lo_q) >> ((s < a_env_lo_q) ? A_ATK_SHIFT : dk);
+    if (a_env_hi_q < a_env_lo_q) {                      // crossed: collapse to the DC
+        int32_t mid = (a_env_hi_q + a_env_lo_q) >> 1;
+        a_env_hi_q = a_env_lo_q = mid;
+    }
+
+    uint16_t hi = (uint16_t)(a_env_hi_q >> A_ENV_Q);
+    uint16_t lo = (uint16_t)(a_env_lo_q >> A_ENV_Q);
+    a_lvl_dark = hi; a_lvl_light = lo;
+    uint16_t span = (hi > lo) ? (uint16_t)(hi - lo) : 0u;
+    uint16_t mid  = (uint16_t)(((uint32_t)hi + lo) >> 1);
+    uint16_t hyst = (uint16_t)(span >> A_HYST_SHIFT);
+    a_thr_dec = mid;
+    a_thr_lo  = (mid > hyst) ? (uint16_t)(mid - hyst) : 0u;   // below -> light
+    a_thr_hi  = (uint16_t)(mid + hyst);                       // above -> dark
+}
+
+static inline bool a_classify(uint16_t adc) {
+    if (a_line_light) { if (adc >= a_thr_hi) a_line_light = false; }
+    else              { if (adc <  a_thr_lo) a_line_light = true;  }
+    return a_line_light;
+}
+
+static inline void a_to_idle(bool armed) {
+    a_state = ST_IDLE; a_armed = armed; a_idle_dark = 0; a_light_run = 0;
+}
+
+static void a_finalize_frame(bool framing_ok) {
+    // Per-frame contrast validation squelches noise: a frame that "decodes" out
+    // of a flat line (span below the floor) is rejected. The envelopes do the
+    // level learning continuously, so nothing is nudged here.
+    uint16_t contrast = (a_frame_dmax > a_frame_lmin)
+                      ? (uint16_t)(a_frame_dmax - a_frame_lmin) : 0u;
+    if (!framing_ok) {
+        g_rx_ferr++;
+        a_to_idle(/*armed=*/false);  // real garbage (bad stop): demand fresh idle
+    } else if (contrast >= a_min_contrast) {
+        byte_received(a_byte_data);
+        a_to_idle(/*armed=*/true);   // a clean dark stop bit IS the inter-frame idle
+    } else {
+        // Framing OK but below the squelch floor: just noise. Drop the byte but
+        // stay ARMED -- demanding re-idle here is what made us miss the first real
+        // start bit after a noisy lull.
+        a_to_idle(/*armed=*/true);
+    }
+}
+
+// Decode the just-completed bit and advance. Mirrors the digital decode's byte
+// assembly: NRZ uses the bit-centre level; IrDA uses "a pulse fell in this bit".
+static void a_finalize_bit(void) {
+    uint8_t idx = a_bit_index;
+    if (g_encoding == ENC_NRZ) {
+        bool dark = (a_bit_lvl >= a_thr_dec);             // dark == logical 1
+        if (idx == 0)      { if (dark) { a_to_idle(false); return; } }  // false start
+        else if (idx <= 8) { if (dark) a_byte_data |= (uint8_t)(1u << (idx - 1u)); }
+        else               { a_finalize_frame(/*ok=*/dark); return; }   // stop = mark
+    } else {                                              // IrDA: pulse == logical 0
+        bool pulse = a_bit_pulse;
+        if (idx == 0)      { if (!pulse) { a_to_idle(false); return; } }
+        else if (idx <= 8) { if (!pulse) a_byte_data |= (uint8_t)(1u << (idx - 1u)); }
+        else               { a_finalize_frame(/*ok=*/!pulse); return; } // stop = no pulse
+    }
+    a_bit_index = (uint8_t)(idx + 1u);
+}
+
+// Feed one ADC sample to the oversampling receiver (called from the TC4 ISR).
+static void a_process_sample(uint16_t adc) {
+    a_track_env(adc);                 // update envelopes + thresholds every sample
+    bool light = a_classify(adc);
+
+    if (a_state == ST_IDLE) {
+        // Start-bit / leading-edge detection. The line idles HIGH (dark); a real
+        // transmission opens with a bright pulse -- the level dropping a genuine
+        // amount below the (possibly noisy/drifting) dark baseline. Triggering on
+        // THIS absolute drop, not on the midpoint classifier, is what keeps a
+        // near-zero-span squelched baseline from tripping fake starts on noise and
+        // leaving us mid-fake-frame (misaligned) when the real burst arrives.
+        bool real_pulse = ((int32_t)adc < (int32_t)a_lvl_dark - (int32_t)A_MIN_CONTRAST);
+        if (!real_pulse) {
+            a_light_run = 0;             // a non-pulse sample == idle/mark
+            if (a_idle_dark < 0xFFFFu) a_idle_dark++;
+            if (!a_armed && a_idle_dark >= (uint16_t)(a_oversample * A_ARM_BITS))
+                a_armed = true;
+            return;
+        }
+        if (!a_armed) { a_idle_dark = 0; return; }   // not settled (e.g. recovery ramp)
+        // armed + a real bright pulse => leading edge of a start bit; anchor here.
+        a_state       = ST_RECEIVING;
+        a_bit_index   = 0;
+        a_byte_data   = 0;
+        a_samp_in_bit = 0;
+        a_frame_lmin  = adc;
+        a_frame_dmax  = adc;
+        a_bit_lvl     = adc;
+        a_bit_pulse   = true;        // the start-bit dip is itself a pulse
+        a_light_run   = 0;
+        // fall through to accumulate this sample (sample 0 of the start bit)
+    }
+
+    // ---- accumulate this sample into the current bit window ----
+    if (adc < a_frame_lmin) a_frame_lmin = adc;
+    if (adc > a_frame_dmax) a_frame_dmax = adc;
+
+    if (g_encoding == ENC_NRZ) {
+        // Sample once in the settled region (A_NRZ_SAMPLE_NUM/DEN of the bit). Both
+        // edges are RC-limited and complete near the start of the cell, so a single
+        // point past the transition reads the true level -- and, unlike a late-half
+        // peak, it can't be fooled by an unfinished symmetric edge bleeding in.
+        uint8_t pt = (uint8_t)(((uint16_t)a_oversample * A_NRZ_SAMPLE_NUM)
+                               / A_NRZ_SAMPLE_DEN);
+        if (a_samp_in_bit == pt) a_bit_lvl = adc;
+    } else {
+        // IrDA pulses sit in the first 3/16 of the cell; only look there, so a slow
+        // recovery tail from the previous bit can't smear in as a false pulse.
+        uint8_t half = (uint8_t)(a_oversample >> 1);
+        if (a_samp_in_bit < half && light) a_bit_pulse = true;
+    }
+
+    if (light) { if (a_light_run < 0xFFFFu) a_light_run++; } else a_light_run = 0;
+    if (a_light_run > (uint16_t)(a_oversample * A_SAT_BITS)) { a_to_idle(false); return; }
+
+    if (++a_samp_in_bit < a_oversample) return;
+
+    a_finalize_bit();
+    a_samp_in_bit = 0;
+    a_bit_pulse   = false;
+}
+
 // ---------------------------------------------------------------------------
 // PT edge interrupt: timestamps each falling edge (light pulse / NRZ start bit)
 // by reading the free-running TC4 COUNT. Registered via the Arduino core's
@@ -270,7 +529,7 @@ static void tc4_clock_once(void) {
 // ---------------------------------------------------------------------------
 
 static void pt_edge_isr(void) {
-    if (g_dir != DIR_RX) return;
+    if (g_dir != DIR_RX || g_rx_mode != RX_DIGITAL) return;   // analog RX uses the ADC
     uint16_t now = TC4_READ_COUNT();
 
     if (g_rx_state == ST_IDLE) {
@@ -354,8 +613,18 @@ extern "C" void TC4_Handler(void) {
 
     if (g_dir != DIR_RX) { TC4->COUNT16.INTFLAG.reg = flags; return; }
 
-    // ---- RX compare: NRZ bit-sample tick, or IrDA end-of-byte. Edges arrive
-    //      via the PT edge ISR (pt_edge_isr), not here. ----
+    // ---- Analog RX: every tick reads the latest free-running ADC conversion
+    //      and feeds the oversampling receiver. ----
+    if (g_rx_mode == RX_ANALOG) {
+        if (flags & TC_INTFLAG_MC0) {
+            TC4->COUNT16.INTFLAG.reg = TC_INTFLAG_MC0;
+            a_process_sample((uint16_t)ADC->RESULT.reg);
+        }
+        return;
+    }
+
+    // ---- Digital RX compare: NRZ bit-sample tick, or IrDA end-of-byte. Edges
+    //      arrive via the PT edge ISR (pt_edge_isr), not here. ----
     if (flags & TC_INTFLAG_MC0) {
         TC4->COUNT16.INTFLAG.reg = TC_INTFLAG_MC0;
 
@@ -414,7 +683,8 @@ static inline void pt_gate_off(void) {
 static void enter_idle(void) {
     tc4_disable();
     TC4->COUNT16.INTENCLR.reg = TC_INTENCLR_MC0;
-    detachInterrupt(digitalPinToInterrupt(PT_ARDUINO_PIN));
+    detachInterrupt(digitalPinToInterrupt(PT_ARDUINO_PIN));  // no-op if not attached
+    adc_stop();                                              // no-op if analog RX unused
     g_dir = DIR_IDLE;
     led_gpio_off();
     pt_gate_off();
@@ -422,6 +692,7 @@ static void enter_idle(void) {
 
 static void enter_tx(void) {
     detachInterrupt(digitalPinToInterrupt(PT_ARDUINO_PIN));
+    adc_stop();
     pt_gate_off();
     led_gpio_off();                                    // LED is GPIO, parked off
     tc4_disable();
@@ -453,7 +724,7 @@ static void enter_tx(void) {
     tc4_sync();
 }
 
-static void enter_rx(void) {
+static void enter_rx_digital(void) {
     led_gpio_off();
     g_rx_bit_ticks = baud_to_rx_ticks(g_rx_baud);
 #if RX_NOISE_FILTERING
@@ -504,6 +775,73 @@ static void enter_rx(void) {
 #endif
 }
 
+static void enter_rx_analog(void) {
+    led_gpio_off();
+
+    // Pick oversampling: as high as the ADC can sustain at this baud, capped.
+    // (At high baud A_ADC_CEIL/baud < MIN; we clamp to MIN and it undersamples --
+    // analog RX is the low-baud / weak-light path, so that's an accepted edge.)
+    uint32_t ovs = A_ADC_CEIL_SPS / (g_rx_baud ? g_rx_baud : 1u);
+    if (ovs > A_OVERSAMPLE_MAX) ovs = A_OVERSAMPLE_MAX;
+    if (ovs < A_OVERSAMPLE_MIN) ovs = A_OVERSAMPLE_MIN;
+    ovs &= ~1u;                                    // keep it even (clean bit centre)
+    a_oversample = (uint8_t)ovs;
+
+    // Reset the receiver FSM.
+    a_state = ST_IDLE; a_armed = false;
+    a_samp_in_bit = 0; a_bit_index = 0; a_byte_data = 0;
+    a_bit_pulse = false; a_line_light = false;
+    a_idle_dark = 0; a_light_run = 0;
+    g_ring_head = g_ring_tail = 0;
+    g_rx_ferr = g_rx_bufovf = 0;
+    g_rx_ferr_reported = g_rx_bufovf_reported = 0;
+
+    tc4_disable();
+    TC4->COUNT16.CTRLA.bit.SWRST = 1;
+    tc4_sync();
+
+    g_dir = DIR_RX;
+
+    // Start the ADC and seed the dark level from a handful of idle conversions
+    // (the line is assumed quiescent/dark when RX is entered).
+    adc_start_freerun();
+    uint32_t acc = 0;
+    for (uint8_t i = 0; i < 16; i++) {
+        while (!ADC->INTFLAG.bit.RESRDY) { /* spin for a conversion */ }
+        acc += ADC->RESULT.reg;
+    }
+    // Seed the slicer: high envelope at the (dark) idle level, low envelope one
+    // min-contrast below it, so there's a usable threshold from the first frame.
+    // If no real light ever arrives, the low envelope decays back up and squelches.
+    uint16_t seed = (uint16_t)(acc >> 4);
+    uint16_t seed_lo = (seed > A_MIN_CONTRAST) ? (uint16_t)(seed - A_MIN_CONTRAST) : 0u;
+    a_env_hi_q = (int32_t)seed    << A_ENV_Q;
+    a_env_lo_q = (int32_t)seed_lo << A_ENV_Q;
+    a_track_env(seed);                                    // derive initial thresholds
+    a_armed = true;                                       // seeded from idle
+    a_idle_dark = (uint16_t)(a_oversample * A_ARM_BITS);
+
+    // TC4 MFRQ tick at a_oversample * rx_baud; MC0 stays armed for every tick.
+    uint32_t tick_hz = (uint32_t)a_oversample * (g_rx_baud ? g_rx_baud : 1u);
+    uint16_t period  = (uint16_t)((TX_TICK_HZ / tick_hz) - 1u);
+    TC4->COUNT16.CTRLA.reg = TC_CTRLA_MODE_COUNT16
+                           | TC_CTRLA_WAVEGEN_MFRQ
+                           | TC_CTRLA_PRESCALER_DIV16;
+    TC4->COUNT16.CC[0].reg = period;
+    tc4_sync();
+
+    TC4->COUNT16.INTFLAG.reg  = TC_INTFLAG_MC0;
+    TC4->COUNT16.INTENSET.reg = TC_INTENSET_MC0;
+    NVIC_EnableIRQ(TC4_IRQn);
+    TC4->COUNT16.CTRLA.bit.ENABLE = 1;
+    tc4_sync();
+}
+
+static void enter_rx(void) {
+    if (g_rx_mode == RX_ANALOG) enter_rx_analog();
+    else                        enter_rx_digital();
+}
+
 // Blocking transmit of a blob, byte by byte, reusing the TX bit-clock ISR.
 static void send_blob(const uint8_t *buf, uint16_t len) {
     for (uint16_t i = 0; i < len; i++) {
@@ -543,12 +881,13 @@ static uint8_t    g_cbuf[MAX_FRAME];
 static void handle_command(uint8_t type, const uint8_t *p, uint16_t len) {
     switch (type) {
         case CMD_CONFIG:
-            if (len != 9) { usb_send_err(ERR_BAD_LEN); return; }
+            if (len != 10) { usb_send_err(ERR_BAD_LEN); return; }
             g_tx_baud  = (uint32_t)p[0] | ((uint32_t)p[1] << 8)
                        | ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
             g_rx_baud  = (uint32_t)p[4] | ((uint32_t)p[5] << 8)
                        | ((uint32_t)p[6] << 16) | ((uint32_t)p[7] << 24);
             g_encoding = (p[8] == ENC_IRDA) ? ENC_IRDA : ENC_NRZ;
+            g_rx_mode  = (p[9] == RX_ANALOG) ? RX_ANALOG : RX_DIGITAL;
             g_configured = true;
             enter_idle();
             usb_send_empty(MSG_OK);
@@ -643,6 +982,30 @@ static void forward_rx_bytes(void) {
     }
 }
 
+// Throttled diagnostic: surface the analog autotuner state so the bench can watch
+// the levels/threshold converge. New message type; non-analog hosts ignore it.
+static void emit_rx_tune(void) {
+    if (g_dir != DIR_RX || g_rx_mode != RX_ANALOG) return;
+    static uint32_t last_ms = 0;
+    uint32_t now = millis();
+    if ((uint32_t)(now - last_ms) < 250u) return;
+    last_ms = now;
+
+    uint16_t dark = a_lvl_dark, light = a_lvl_light;
+    uint16_t thr = a_thr_dec, mc = a_min_contrast;
+    uint16_t span = (dark > light) ? (uint16_t)(dark - light) : 0u;
+    uint8_t locked = (span >= mc) ? 1u : 0u;
+    uint8_t pl[12] = {
+        (uint8_t)dark,  (uint8_t)(dark >> 8),
+        (uint8_t)light, (uint8_t)(light >> 8),
+        (uint8_t)span,  (uint8_t)(span >> 8),    // was "noise"; now the live envelope span
+        (uint8_t)thr,   (uint8_t)(thr >> 8),
+        (uint8_t)mc,    (uint8_t)(mc >> 8),
+        a_oversample,   locked,
+    };
+    usb_send(MSG_RX_TUNE, pl, sizeof(pl));
+}
+
 void setup() {
     Serial.begin(USB_BAUD);
     tc4_clock_once();
@@ -652,4 +1015,5 @@ void setup() {
 void loop() {
     poll_usb_commands();
     forward_rx_bytes();
+    emit_rx_tune();
 }

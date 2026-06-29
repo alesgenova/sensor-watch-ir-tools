@@ -43,6 +43,7 @@ from ir_modem import (
     Modem, handshake, HANDSHAKE_BAUD, RESET_DELAY_S,
     CMD_TX, CMD_STOP, TX_FLAG_AUTO_RX,
     MSG_RX, MSG_TX_DONE, MSG_ERR,
+    RX_DIGITAL, RX_ANALOG,
 )
 from serial_frame import build_frame, MAX_PAYLOAD
 
@@ -437,7 +438,8 @@ def patch_flash(args, base, from_size, to_size, ref_crc, new_crc, shift_size, bo
     print(f"window:   shift_size {shift_size} B (watch aux RAM, or in-flash shift "
           f"if it won't fit)   from {from_size} / to {to_size}")
     print(f"crc:      ref 0x{ref_crc:08X}  new 0x{new_crc:08X}")
-    print(f"baud:     data {args.baud} / ack {args.ack_baud}  encoding {args.encoding}")
+    print(f"baud:     data {args.baud} / ack {args.ack_baud}  encoding {args.encoding}"
+          f"  rx={'digital' if args.digital_rx else 'analog'}")
 
     try:
         ser = serial.Serial(args.device, baudrate=HANDSHAKE_BAUD, timeout=0.1)
@@ -447,7 +449,8 @@ def patch_flash(args, base, from_size, to_size, ref_crc, new_crc, shift_size, bo
     time.sleep(RESET_DELAY_S)
     ser.reset_input_buffer()
     modem = Modem(ser)
-    handshake(modem, args.baud, args.ack_baud, args.encoding)
+    handshake(modem, args.baud, args.ack_baud, args.encoding,
+              RX_DIGITAL if args.digital_rx else RX_ANALOG)
     print("modem ready.")
 
     try:
@@ -540,6 +543,9 @@ def main():
                         f"Default: {DEFAULT_ACK_BAUD}")
     p.add_argument('--encoding', choices=['irda', 'nrz'], default='nrz',
                    help="IR encoding, both directions. Default: nrz")
+    p.add_argument('--digital-rx', action='store_true',
+                   help="Use digital edge-detection RX instead of the default "
+                        "analog polled RX. Faster, but needs a strong, clean signal.")
     p.add_argument('--timeout', type=float, default=0.5,
                    help="Per-frame ACK timeout in seconds. Default: 0.5")
     p.add_argument('--retries', type=int, default=50,
@@ -702,7 +708,8 @@ def main():
     print(f"send:     blocks {start}..{end - 1} ({count} of {num})"
           f"{'  [RESUME: no arm/test]' if resume else ''}"
           f"{'  [partial]' if count < num else ''}")
-    print(f"baud:     data {args.baud} / ack {args.ack_baud}  encoding {args.encoding}")
+    print(f"baud:     data {args.baud} / ack {args.ack_baud}  encoding {args.encoding}"
+          f"  rx={'digital' if args.digital_rx else 'analog'}")
     print(f"retries:  {args.retries}  timeout {args.timeout}s")
     print(f"test:     {args.test_blocks} block(s)"
           f"{' (test-only)' if args.test_only else ''}"
@@ -717,7 +724,8 @@ def main():
     time.sleep(RESET_DELAY_S)
     ser.reset_input_buffer()
     modem = Modem(ser)
-    handshake(modem, args.baud, args.ack_baud, args.encoding)
+    handshake(modem, args.baud, args.ack_baud, args.encoding,
+              RX_DIGITAL if args.digital_rx else RX_ANALOG)
     print("modem ready.")
 
     # Link-reliability test stage (mirrors the watch's flash TEST mode). Needs
