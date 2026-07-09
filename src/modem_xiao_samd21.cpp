@@ -13,7 +13,7 @@
 //
 // Hardware mapping (UNO Timer1 -> SAMD21):
 //   * Bit clock + RX bit-sampling : TC4 compare CC0 (the OCR1A/COMPA analogue)
-//   * IR LED                       : PA04 GPIO, driven in the TX bit-clock ISR
+//   * IR LED                       : PA06 GPIO, driven in the TX bit-clock ISR
 //   * PT edge timestamps (RX)      : PA07 -> EIC EXTINT7 interrupt; the ISR reads
 //                                    the free-running TC4 COUNT as the timestamp
 //                                    (the ICP1/ICR1 input-capture analogue). The
@@ -65,7 +65,7 @@
 // Board / pin config (PORT group A)
 // ---------------------------------------------------------------------------
 
-#define LED_PIN   4u    // PA04  IR LED, active-high (pin HIGH = lit)
+#define LED_PIN   6u    // PA06 (XIAO D10)  IR LED, active-high (pin HIGH = lit)
 #define PT_PIN    7u    // PA07  phototransistor, active-low / idle-HIGH; -> EIC EXTINT7
 #define PT_EXTINT 7u    // PA07 is on EXTINT[7]
 #define PT_ARDUINO_PIN 8  // XIAO silk D8 / SCK == PA07 (for attachInterrupt)
@@ -1008,6 +1008,21 @@ static void emit_rx_tune(void) {
 
 void setup() {
     Serial.begin(USB_BAUD);
+
+    // Silence the XIAO's onboard blue USB-activity LEDs (TXL = D11/PA19,
+    // RXL = D12/PA18), which the Arduino USB core blinks on every USB transfer.
+    // The core drives them as OUTPUTs (set once at USB init, which Serial.begin()
+    // just ran) and pulls them LOW on each transfer. Re-configuring them as INPUT
+    // here defeats that: on a non-output pin the core's digitalWrite() can only
+    // toggle the pull resistor, never sink the LED, so they stay dark regardless
+    // of USB traffic. (The green power LED is hardwired and can't be disabled.)
+#ifdef PIN_LED_TXL
+    pinMode(PIN_LED_TXL, INPUT);
+#endif
+#ifdef PIN_LED_RXL
+    pinMode(PIN_LED_RXL, INPUT);
+#endif
+
     tc4_clock_once();
     enter_idle();
 }

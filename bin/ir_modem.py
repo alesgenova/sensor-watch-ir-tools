@@ -86,6 +86,14 @@ class Modem:
         self.ser.write(hdr + payload)
         self.ser.flush()
 
+    def drain(self):
+        """Discard any buffered input (OS receive buffer + our parse buffer).
+        Used to resync after the modem may have been left streaming from a prior
+        session (the XIAO SAMD21 has native USB and does NOT reset when the port
+        is reopened, so it can still be in RX, emitting diagnostics)."""
+        self.ser.reset_input_buffer()
+        self._buf.clear()
+
     def _read_into_buf(self, deadline: float):
         timeout = max(0.0, deadline - time.time())
         self.ser.timeout = min(0.1, timeout) if timeout else 0.0
@@ -111,14 +119,38 @@ class Modem:
             self._read_into_buf(deadline)
 
 
+# Async / diagnostic message types the modem emits on its own during an RX
+# session. A leftover one from a prior run must not be mistaken for a command
+# reply, so the handshake skips them while waiting for PONG / OK.
+_ASYNC_MSG_TYPES = (MSG_RX, MSG_RX_STATUS, MSG_RX_TUNE)
+
+
+def _await_reply(modem: Modem, want: int, deadline: float):
+    """Like read_message, but skip stale async diagnostic frames until the
+    wanted reply type arrives (or a non-diagnostic message, e.g. MSG_ERR, which
+    the caller should surface), or the deadline passes."""
+    while True:
+        msg = modem.read_message(deadline)
+        if msg is None or msg[0] == want or msg[0] not in _ASYNC_MSG_TYPES:
+            return msg
+
+
 def handshake(modem: Modem, tx_baud: int, rx_baud: int, encoding: str,
               rx_mode: int = RX_ANALOG):
     """PING/PONG to confirm the modem is alive + the right version, then CONFIG
     it with tx/rx baud, encoding, and RX front-end mode. Exits on failure.
     Receive-only callers can pass any valid tx_baud (the modem only uses it on a
     CMD_TX). rx_mode selects analog polled RX (default) or digital edge RX."""
+    # The XIAO SAMD21 does not reset when the port is reopened (native USB), so it
+    # may still be in RX from a prior run (e.g. after a Ctrl+C), streaming
+    # diagnostics. Quiesce it (CMD_STOP -> idle stops those), let the last ones
+    # arrive, then drain so none is misread as our PONG/OK below.
+    modem.send(CMD_STOP)
+    time.sleep(0.2)
+    modem.drain()
+
     modem.send(CMD_PING)
-    msg = modem.read_message(time.time() + 3.0)
+    msg = _await_reply(modem, MSG_PONG, time.time() + 3.0)
     if not msg or msg[0] != MSG_PONG:
         sys.exit(f"error: no PONG from modem (got {msg!r}); is a modem firmware flashed?")
     ver = msg[1][0] if msg[1] else 0
@@ -126,6 +158,6 @@ def handshake(modem: Modem, tx_baud: int, rx_baud: int, encoding: str,
         sys.exit(f"error: modem proto version {ver}, expected {MODEM_PROTO_VERSION}")
     cfg = struct.pack('<IIBB', tx_baud, rx_baud, enc_byte(encoding), rx_mode & 0xFF)
     modem.send(CMD_CONFIG, cfg)
-    msg = modem.read_message(time.time() + 3.0)
+    msg = _await_reply(modem, MSG_OK, time.time() + 3.0)
     if not msg or msg[0] != MSG_OK:
         sys.exit(f"error: modem rejected CONFIG (got {msg!r})")

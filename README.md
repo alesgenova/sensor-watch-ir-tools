@@ -47,7 +47,7 @@ either one unchanged.
 ### Flash the watch
 
 1. On the watch, open the **firmware-flasher face** and press the alarm button to get the watch ready to receive a new firmware.
-2. Line up the probe over the watch's display (see the [photos](#the-prototype-flasher) and [video](#video-walkthrough) instructions)
+2. Place the watch face down on the flasher enclosure, so that the IR LED and phototransistor are right under the watch display area (see the [photos](#the-prototype-flasher)).
 3. Start the flasher script:
 
 ```bash
@@ -58,25 +58,13 @@ bin/firmware_flasher.py firmware.uf2
 bin/firmware_flasher.py new.uf2 --reference current.uf2
 ```
 
+4. If the firmware chunks are not correctly received right away, nudge watch slightly to the left or right, until they are. Only very small adjustments are typically needed.
+
 The defaults (NRZ encoding, 3600 baud data / 300 baud ACK) are the
 [known-good settings](#default-settings) found by bench testing, don't change them unless you know what you're doing.
 
 ---
 
-## Video walkthrough
-
-Achieving a reliable two-way optical link can be hard on the first try. The transmission from the watch to the flasher is especially finnicky.
-
-Follow this instructions video and you should be able to systematically achieve a solid link:
-
-▶️ **[Instructions Video](img/instructions_540p.mp4)**
-
-1. Start in a dimly lit room
-2. Place the probe on the watch face, with the phototransistor flat against the watch glass
-3. Nudge the probe around until you see the watch red LED flashing about once per second, indicating that the watch is receiving data correctly
-4. Progressively increase the amount of light in the room, until you start reliably receiving data back from the watch.
-
----
 
 ## The prototype flasher
 
@@ -95,17 +83,17 @@ Parts used in the prototype rig:
 
 Pins to use on the MCU with the provided modem firmware:
 
-|             | UNO Pin | XIAO Pin |
-|-------------|---------|----------|
-| VCC         | 5V      | 3.3V     |
-| TX (IR LED) | D9      | D1       |
-| RX (PT)     | A0 (default) or D8 (digital-rx)    | D8       |
+|             | XIAO Pin | UNO Pin |
+|-------------|----------|---------|
+| VCC         | 3.3V     | 5V      |
+| TX (IR LED) | D10      | D9      |
+| RX (PT)     | D8       | A0 or D8 (digital-rx)|
 
 
 <p>
-  <img src="img/flasher_hardware.jpg" alt="The flasher hardware: Arduino UNO + probe next to a Casio F-91W" width="32%">
-  <img src="img/flasher_probe.jpg" alt="Close-up of the two-LED probe head" width="32%">
-  <img src="img/probe_position.jpg" alt="The probe positioned over the watch display, phototransistor over the watch red LED" width="32%">
+  <img src="img/flasher_v2_board.jpg" alt="The flasher prototype board: XIAO SAMD21 + IR LED + Phototransistor" width="32%">
+  <img src="img/flasher_v2_enclosure.jpg" alt="The flasher prototype in its enclosure, with windows for the IR LED and Phototransistor" width="32%">
+  <img src="img/flasher_v2_position.jpg" alt="The position of the watch on the flasher enclosure." width="32%">
 </p>
 
 ---

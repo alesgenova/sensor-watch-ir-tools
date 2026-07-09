@@ -740,7 +740,14 @@ def main():
         except (EOFError, KeyboardInterrupt):
             print("\naborted")
             modem.send(CMD_STOP); ser.close(); return
-        run_test_stage(modem, [b[2] for b in blocks[:m]], "block", args)
+        try:
+            run_test_stage(modem, [b[2] for b in blocks[:m]], "block", args)
+        except KeyboardInterrupt:
+            # Leave the modem idle: the last test frame flipped it to RX (AUTO_RX),
+            # and the XIAO won't reset on the next run's port open, so a stuck-in-RX
+            # modem would stream diagnostics into that run's handshake.
+            print("\ninterrupted")
+            modem.send(CMD_STOP); ser.close(); return
 
     if args.test_only:
         print("test-only: done.")
