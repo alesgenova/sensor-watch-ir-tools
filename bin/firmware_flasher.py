@@ -430,11 +430,26 @@ def patch_flash(args, base, from_size, to_size, ref_crc, new_crc, shift_size, bo
     if num > 0x10000:
         sys.exit("error: patch body too large for a 16-bit frame id")
 
+    # Resume (any --start-block, even 0): the watch is already armed and holds
+    # chunks 0..start-1 from a prior interrupted run that used THIS shift value.
+    # We skip the link test and the patch ENTER and pick the stream up at `start`.
+    # The stream-position validity depends on the shift matching the interrupted
+    # run, which is why main() still shows the shift menu on a resume.
+    resume = args.start_block is not None
+    start = args.start_block if resume else 0
+    if resume and (start < 0 or start >= num):
+        sys.exit(f"error: --start-block {start} out of range [0, {num}) for this patch "
+                 f"(this shift produces {num} chunk(s); did you pick the same shift as "
+                 f"the interrupted run?)")
+
     print(f"new:      {args.file}")
     print(f"ref:      {args.reference}")
     print(f"device:   {args.device}")
     print(f"patch:    {len(body)} body bytes -> {num} frame(s)  "
           f"(crle, in-place; vs {to_size} B full image)")
+    if resume:
+        print(f"send:     chunks {start}..{num - 1} ({num - start} of {num})  "
+              f"[RESUME: no test/ENTER]")
     print(f"window:   shift_size {shift_size} B (watch aux RAM, or in-flash shift "
           f"if it won't fit)   from {from_size} / to {to_size}")
     print(f"crc:      ref 0x{ref_crc:08X}  new 0x{new_crc:08X}")
@@ -454,46 +469,61 @@ def patch_flash(args, base, from_size, to_size, ref_crc, new_crc, shift_size, bo
     print("modem ready.")
 
     try:
-        # Link-reliability test: first M body chunks flagged TEST (watch ACKs, does
-        # not commit). Same gate as the full flash; needs the watch in TEST mode.
-        m = min(args.test_blocks, num)
-        if m:
+        if resume:
+            # RESUME: the watch is already mid-patch (armed, chunks 0..start-1
+            # applied) from an interrupted run with THIS shift. No TEST stage and
+            # no ENTER — just confirm and pick the stream up at `start`. The watch's
+            # stop-and-wait dedup accepts last_id+1, so it is waiting for `start`.
             try:
-                input("Put the watch in flash TEST mode (FLASH menu -> Alarm), then "
-                      "press Enter to start the link test (Ctrl-C to abort)... ")
+                ans = input(f"RESUME patch at chunk {start}/{num}: the watch must already "
+                            f"be mid-patch from a run with THIS shift ({shift_size} B). "
+                            f"Resume now? [y/N] ").strip().lower()
             except (EOFError, KeyboardInterrupt):
-                print("\naborted"); modem.send(CMD_STOP); ser.close(); return
-            run_test_stage(modem, chunks[:m], "frame", args)
+                ans = 'n'
+            if ans != 'y':
+                print("not resuming.")
+                modem.send(CMD_STOP); ser.close(); return
+        else:
+            # Link-reliability test: first M body chunks flagged TEST (watch ACKs, does
+            # not commit). Same gate as the full flash; needs the watch in TEST mode.
+            m = min(args.test_blocks, num)
+            if m:
+                try:
+                    input("Put the watch in flash TEST mode (FLASH menu -> Alarm), then "
+                          "press Enter to start the link test (Ctrl-C to abort)... ")
+                except (EOFError, KeyboardInterrupt):
+                    print("\naborted"); modem.send(CMD_STOP); ser.close(); return
+                run_test_stage(modem, chunks[:m], "frame", args)
 
-        if args.test_only:
-            print("test-only: done.")
-            modem.send(CMD_STOP); ser.close(); return
+            if args.test_only:
+                print("test-only: done.")
+                modem.send(CMD_STOP); ser.close(); return
 
-        try:
-            ans = input("POINT OF NO RETURN: the watch will be unresponsive until a "
-                        "flash succeeds. Patch-flash now? [y/N] ").strip().lower()
-        except (EOFError, KeyboardInterrupt):
-            ans = 'n'
-        if ans != 'y':
-            print("not flashing.")
-            modem.send(CMD_STOP); ser.close(); return
+            try:
+                ans = input("POINT OF NO RETURN: the watch will be unresponsive until a "
+                            "flash succeeds. Patch-flash now? [y/N] ").strip().lower()
+            except (EOFError, KeyboardInterrupt):
+                ans = 'n'
+            if ans != 'y':
+                print("not flashing.")
+                modem.send(CMD_STOP); ser.close(); return
 
-        # Patch ENTER: {base, from_size, ref_crc, to_size, shift_size}. The watch
-        # ACKs ONLY if its flash over [base,base+from_size) CRCs to ref_crc, so a
-        # never-arriving ACK means the watch's firmware does not match --reference
-        # (or the link is down). Watch the reply blink and Ctrl-C if it never comes.
-        desc = struct.pack('<IIIII', base, from_size, ref_crc, to_size, shift_size)
-        enter = build_frame(desc, FRAME_ID_ENTER, FLAG_ENTER | FLAG_PATCH | FLAG_VERIFY)
-        print("sending patch ENTER (watch ACKs only if its flash matches the "
-              "reference; Ctrl-C if it never ACKs: wrong --reference or dead link)...")
-        send_enter(modem, enter, args, "ENTER(patch)")
-        print("reference verified; flasher armed (point of no return on the watch "
-              "once the first frame lands).")
+            # Patch ENTER: {base, from_size, ref_crc, to_size, shift_size}. The watch
+            # ACKs ONLY if its flash over [base,base+from_size) CRCs to ref_crc, so a
+            # never-arriving ACK means the watch's firmware does not match --reference
+            # (or the link is down). Watch the reply blink and Ctrl-C if it never comes.
+            desc = struct.pack('<IIIII', base, from_size, ref_crc, to_size, shift_size)
+            enter = build_frame(desc, FRAME_ID_ENTER, FLAG_ENTER | FLAG_PATCH | FLAG_VERIFY)
+            print("sending patch ENTER (watch ACKs only if its flash matches the "
+                  "reference; Ctrl-C if it never ACKs: wrong --reference or dead link)...")
+            send_enter(modem, enter, args, "ENTER(patch)")
+            print("reference verified; flasher armed (point of no return on the watch "
+                  "once the first frame lands).")
 
-        # Stream the crle body as FLAG_PATCH frames (ids 0..N-1).
-        patch_items = [(i & 0xFFFF, build_frame(chunk, i & 0xFFFF, FLAG_PATCH),
-                        f"frame {i} (id {i & 0xFFFF})  [{i + 1}/{num}]")
-                       for i, chunk in enumerate(chunks)]
+        # Stream the crle body as FLAG_PATCH frames (ids start..N-1).
+        patch_items = [(i & 0xFFFF, build_frame(chunks[i], i & 0xFFFF, FLAG_PATCH),
+                        f"frame {i} (id {i & 0xFFFF})  [{i - start + 1}/{num - start}]")
+                       for i in range(start, num)]
         stream_frames(modem, patch_items, args, "frame")
 
         # EXIT: {base, to_size, new_crc}. The watch CRCs the reconstructed image and,
@@ -558,11 +588,17 @@ def main():
                         "Default: 4")
     p.add_argument('--test-only', action='store_true',
                    help="Stop after the link test; do not flash.")
-    p.add_argument('--start-block', type=int, default=0, metavar='N',
-                   help="Index of the first UF2 block to send (default 0). >0 means "
-                        "RESUME: the watch must already be in its flasher from a prior "
-                        "run with blocks 0..N-1 written; the ENTER (arm) frame and the "
-                        "test stage are skipped.")
+    p.add_argument('--start-block', type=int, default=None, metavar='N',
+                   help="Index of the first block to send. Omit for a fresh flash (test "
+                        "stage, then ENTER/arm, then stream from block 0). SPECIFYING it "
+                        "at all -- including --start-block 0 -- means RESUME: the watch is "
+                        "already in its flasher (from a prior run that wrote blocks "
+                        "0..N-1, or that you interrupted), so the test stage and the ENTER "
+                        "(arm) frame are skipped and blocks are streamed from N onward "
+                        "(N=0 re-streams the whole image via the watch's 'id 0 = restart' "
+                        "rule). With --reference, N is a PATCH-CHUNK index; the shift menu "
+                        "is still shown so you can pick the SAME shift as the interrupted "
+                        "run.")
     p.add_argument('--count', type=int, default=None, metavar='N',
                    help="How many blocks to send, starting at --start-block (default: "
                         "all remaining). Use a small value to exercise the link quickly "
@@ -604,9 +640,8 @@ def main():
     if args.reference:
         if not os.path.isfile(args.reference):
             sys.exit(f"error: reference file not found: {args.reference}")
-        if args.start_block:
-            sys.exit("error: --start-block (resume) is not supported with --reference; "
-                     "a patch is applied in place and cannot be restarted mid-stream.")
+        if args.start_block is not None and args.start_block < 0:
+            sys.exit(f"error: --start-block must be >= 0, got {args.start_block}")
         try:
             import detools  # noqa: F401
         except ImportError:
@@ -681,10 +716,13 @@ def main():
     if num > 0x10000:
         sys.exit("error: image has too many blocks for a 16-bit frame id")
 
-    # Block selection (--start-block / --count). start>0 = resume into a watch
-    # already in its flasher.
-    start = args.start_block
-    if start < 0 or start >= num:
+    # Block selection (--start-block / --count). Omitting --start-block = a fresh
+    # flash (test + arm from block 0). Specifying it (even 0) = the watch is
+    # already in its flasher, so skip the test stage and the ENTER (arm) frame and
+    # stream from that block.
+    resume = args.start_block is not None
+    start = args.start_block if resume else 0
+    if resume and (start < 0 or start >= num):
         sys.exit(f"error: --start-block {start} out of range [0, {num})")
     count = (num - start) if args.count is None else args.count
     if count < 1:
@@ -694,8 +732,11 @@ def main():
               f"clamping to {num - start}")
         count = num - start
     end = start + count                 # exclusive
-    resume = (start > 0)
-    arm    = not resume                 # arm only on a fresh flash from block 0
+    # `arm` sends the ENTER frame (drops the watch from TEST into the flasher);
+    # only on a fresh flash. `restartable` (may re-stream from the top on a failed
+    # verify) depends solely on starting at id 0, per the watch's 'id 0 = restart'.
+    arm         = not resume
+    restartable = (start == 0)
 
     # The descriptor (and the final CRC) always cover the WHOLE image, regardless
     # of which subset we send this run.
@@ -706,14 +747,14 @@ def main():
     print(f"image:    {num} blocks, 0x{base:08X}..0x{base + total_length:08X} "
           f"({total_length} bytes)  crc32 0x{image_crc:08X}")
     print(f"send:     blocks {start}..{end - 1} ({count} of {num})"
-          f"{'  [RESUME: no arm/test]' if resume else ''}"
+          f"{'  [pre-armed: no arm/test]' if resume else ''}"
           f"{'  [partial]' if count < num else ''}")
     print(f"baud:     data {args.baud} / ack {args.ack_baud}  encoding {args.encoding}"
           f"  rx={'digital' if args.digital_rx else 'analog'}")
     print(f"retries:  {args.retries}  timeout {args.timeout}s")
     print(f"test:     {args.test_blocks} block(s)"
           f"{' (test-only)' if args.test_only else ''}"
-          f"{' (skipped: resume)' if resume and args.test_blocks else ''}")
+          f"{' (skipped: pre-armed)' if resume and args.test_blocks else ''}")
 
     try:
         ser = serial.Serial(args.device, baudrate=HANDSHAKE_BAUD, timeout=0.1)
@@ -772,7 +813,7 @@ def main():
     send_rows = [(idx, rows[idx][0], rows[idx][1]) for idx in range(start, end)]
     try:
         flash_stage(modem, base, total_length, image_crc, send_rows, args,
-                    arm=arm, restartable=arm)
+                    arm=arm, restartable=restartable)
     except KeyboardInterrupt:
         print("\ninterrupted")
     finally:
