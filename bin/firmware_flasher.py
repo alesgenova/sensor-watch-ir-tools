@@ -108,6 +108,51 @@ def parse_uf2(data: bytes):
     return blocks
 
 
+# --- firmware_flasher_face presence guard -----------------------------------
+#
+# Flashing a firmware that lacks the watch's firmware_flasher_face would be the
+# LAST IR flash that watch ever accepts: the face is what receives frames, so
+# once it's gone the only way back is USB UF2 recovery. Before committing we
+# fingerprint the incoming image to make sure the face is still in it.
+#
+# A flashed binary carries no symbol names, so we can't look for
+# "firmware_flasher_face" itself. What DOES survive are the .rodata string
+# literals it renders. We deliberately fingerprint on the labels UNIQUE to this
+# face -- the FLASH menu entry (" FlASH"), the link-test screen ("tESt ") and the
+# wait-for-block screen ("WA1T") -- NOT the baud/encoding menu labels, which the
+# ir_tx_face / ir_rx_face share (e.g. "EncOd") and so would false-positive. All
+# three live in firmware_flasher_face.c and are emitted by always-compiled render
+# functions, so the face links them in as a unit: present together, or not at all.
+# We require ALL of them. That unit-linking is exactly why demanding all three is
+# safe (a real flasher build always has every one), and it makes a false positive
+# -- flashing a face-less image, the one dangerous direction -- vanishingly
+# unlikely. If a screen is ever reworded upstream, update the list here (or use
+# --allow-no-flasher-face for a one-off).
+FLASHER_FACE_MARKERS = (
+    b' FlASH',    # IR_FLASHER_MENU_FLASH: the menu entry that starts a flash
+    b'tESt ',     # test-phase screen (top row)
+    b'WA1T',      # ENTER-acked, waiting-for-first-block screen
+)
+FLASHER_FACE_MARKERS_MIN = len(FLASHER_FACE_MARKERS)   # require every marker
+
+
+def assert_flasher_face_present(image: bytes, label: str, allow_missing: bool):
+    """Abort unless `image` (the assembled firmware bytes) looks like it contains
+    the firmware_flasher_face, so we never flash away the ability to re-flash."""
+    found = sorted(m.decode() for m in FLASHER_FACE_MARKERS if m in image)
+    if len(found) >= FLASHER_FACE_MARKERS_MIN:
+        return
+    msg = (f"{label} does not appear to contain the firmware_flasher_face "
+           f"(matched {len(found)}/{len(FLASHER_FACE_MARKERS)} of its markers"
+           f"{': ' + ', '.join(found) if found else ''}; need "
+           f"{FLASHER_FACE_MARKERS_MIN}). Flashing it would leave the watch unable "
+           f"to receive another IR flash; the only recovery would be USB UF2.")
+    if allow_missing:
+        print(f"WARNING: {msg}\n         Proceeding anyway (--allow-no-flasher-face).")
+    else:
+        sys.exit(f"error: {msg}\n       Pass --allow-no-flasher-face to override.")
+
+
 DEBUG = False   # set from --debug; dumps raw optical bytes during the ACK wait
 
 
@@ -615,6 +660,11 @@ def main():
                         "needs) for the interactive prompt's option 1. Clamped up to the "
                         "minimum the patch needs. Omit to default to 2048 B. Bigger = a "
                         "marginally smaller patch for more watch RAM.")
+    p.add_argument('--allow-no-flasher-face', action='store_true',
+                   help="Skip the safety check that the UF2 still contains the "
+                        "firmware_flasher_face. Flashing a firmware without it means "
+                        "the watch can never be re-flashed over IR (USB UF2 recovery "
+                        "only). Only use if you know what you're doing.")
     p.add_argument('--debug', action='store_true',
                    help="Dump every raw byte the modem decodes during each ACK "
                         "wait (hex), and what id was expected. Use to see whether "
@@ -649,6 +699,9 @@ def main():
                      "or use this repo's .venv/bin/python).")
         rbase, ref_img, ref_crc = _image_bytes(args.reference)
         nbase, new_img, new_crc = _image_bytes(args.file)
+        # Guard the NEW image (what ends up on the watch); refuse a firmware that
+        # would strip the flasher face and make this the last IR flash.
+        assert_flasher_face_present(new_img, args.file, args.allow_no_flasher_face)
         if rbase != nbase:
             sys.exit(f"error: reference base 0x{rbase:08X} != new base 0x{nbase:08X}")
         from_r, _growth, min_shift, max_window = patch_geometry(
@@ -741,6 +794,12 @@ def main():
     # The descriptor (and the final CRC) always cover the WHOLE image, regardless
     # of which subset we send this run.
     base, total_length, image_crc, rows = assemble_image(blocks)
+
+    # Refuse to flash a firmware that would strip the flasher face (checked on the
+    # whole image, even for a partial --start-block/--count run: the watch ends up
+    # holding the whole thing, so a missing face bricks IR reflash either way).
+    assert_flasher_face_present(b''.join(row for _addr, row in rows),
+                                args.file, args.allow_no_flasher_face)
 
     print(f"file:     {args.file}")
     print(f"device:   {args.device}")
