@@ -23,6 +23,9 @@ The host tooling here pairs with the watch-side faces that can be found at the *
 git clone https://github.com/alesgenova/sensor-watch-ir-tools.git
 cd sensor-watch-ir-tools
 
+# Get the ultrapatch source code
+git submodule update --init ultrapatch
+
 # Python deps (a venv is recommended)
 python3 -m venv .venv
 source .venv/bin/activate

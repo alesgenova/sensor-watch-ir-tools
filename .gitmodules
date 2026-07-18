@@ -1,0 +1,3 @@
+[submodule "ultrapatch"]
+	path = ultrapatch
+	url = https://github.com/BarsMonster/UltraPatch.git

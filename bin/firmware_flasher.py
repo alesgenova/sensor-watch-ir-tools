@@ -47,15 +47,18 @@ from ir_modem import (
 )
 from serial_frame import build_frame, MAX_PAYLOAD
 
-# Frame flag bits; MUST match watch firmware_flasher_ramfunc.h.
-# (Bit 1 is unused: the old LAST_FRAME marker is gone. The watch stays in TEST
-# until ENTER, and the EXIT frame terminates the data stream.)
+# Frame flag bits; MUST match watch firmware-flasher/firmware_flasher_core.h.
+# THE PATCH BIT IS THE FORMAT: each patch dialect has its own flag bit, and a
+# watch build only recognizes its compiled-in decoder's bit as "patch" -- on
+# the ENTER and on every body frame. A dialect mismatch (wrong --patch-format,
+# or a mixed-up --start-block resume) is silence from the very first frame,
+# BEFORE anything is written.
+FLAG_PATCH_DETOOLS = 1 << 5   # detools crle dialect (legacy value)
+FLAG_PATCH_ULTRA   = 1 << 1   # UltraPatch dialect
 FLAG_TEST        = 1 << 2   # link-test frame: watch ACKs but does NOT commit it
 FLAG_ENTER       = 1 << 3   # enter the real flasher; EMPTY payload (full flash), or
-                            # with FLAG_PATCH+FLAG_VERIFY = the 20-byte patch header
+                            # with a patch-dialect bit + FLAG_VERIFY = the 20-byte patch header
 FLAG_VERIFY      = 1 << 4   # EXIT: final whole-image CRC check; payload = 12-byte descriptor
-FLAG_PATCH       = 1 << 5   # delta (patch) flash, not a verbatim uf2-like one: on ENTER
-                            # = patch session (+header); on a data frame = a patch chunk
 
 # Real-flash protocol constants; MUST match the watch.
 ROW_SIZE         = 256              # one NVMCTRL row = one data block's firmware bytes
@@ -108,45 +111,50 @@ def parse_uf2(data: bytes):
     return blocks
 
 
-# --- firmware_flasher_face presence guard -----------------------------------
+# --- firmware_flasher_face beacon -------------------------------------------
 #
-# Flashing a firmware that lacks the watch's firmware_flasher_face would be the
-# LAST IR flash that watch ever accepts: the face is what receives frames, so
-# once it's gone the only way back is USB UF2 recovery. Before committing we
-# fingerprint the incoming image to make sure the face is still in it.
+# The face embeds a deliberate, host-detectable beacon (see
+# firmware_flasher_face.c): 8-byte magic (incl. NUL), a layout version, and
+# the patch-dialect flag bit that build speaks. It serves two jobs:
 #
-# A flashed binary carries no symbol names, so we can't look for
-# "firmware_flasher_face" itself. What DOES survive are the .rodata string
-# literals it renders. We deliberately fingerprint on the labels UNIQUE to this
-# face -- the FLASH menu entry (" FlASH"), the link-test screen ("tESt ") and the
-# wait-for-block screen ("WA1T") -- NOT the baud/encoding menu labels, which the
-# ir_tx_face / ir_rx_face share (e.g. "EncOd") and so would false-positive. All
-# three live in firmware_flasher_face.c and are emitted by always-compiled render
-# functions, so the face links them in as a unit: present together, or not at all.
-# We require ALL of them. That unit-linking is exactly why demanding all three is
-# safe (a real flasher build always has every one), and it makes a false positive
-# -- flashing a face-less image, the one dangerous direction -- vanishingly
-# unlikely. If a screen is ever reworded upstream, update the list here (or use
-# --allow-no-flasher-face for a one-off).
-FLASHER_FACE_MARKERS = (
-    b' FlASH',    # IR_FLASHER_MENU_FLASH: the menu entry that starts a flash
-    b'tESt ',     # test-phase screen (top row)
-    b'WA1T',      # ENTER-acked, waiting-for-first-block screen
-)
-FLASHER_FACE_MARKERS_MIN = len(FLASHER_FACE_MARKERS)   # require every marker
+#   * Lockout guard: flashing a firmware without the beacon would be the LAST
+#     IR flash that watch ever accepts (the face is what receives frames), so
+#     we refuse to flash a beacon-less NEW image.
+#   * Dialect auto-selection: the REFERENCE image is what's on the watch, so
+#     its beacon tells us which --patch-format the watch speaks right now.
+#
+# The magic never changes; beacon_version gates the fields after it. Images
+# built before the beacon exist in the wild: they fail the guard (override
+# with --allow-no-flasher-face if you knowingly flash one) and provide no
+# dialect (fall back to --patch-format / its default).
+FLASHER_BEACON_MAGIC = b'SWFLSHR\x00'
+
+
+def find_flasher_beacon(image: bytes):
+    """Return {'version', 'patch_flag'} for the beacon in `image`, or None."""
+    i = image.find(FLASHER_BEACON_MAGIC)
+    if i < 0 or i + 10 > len(image):
+        return None
+    return {'version': image[i + 8], 'patch_flag': image[i + 9]}
+
+
+def beacon_dialect(beacon):
+    """Map a beacon's patch_flag to a --patch-format name, or None."""
+    if beacon is None:
+        return None
+    return {FLAG_PATCH_ULTRA: 'ultrapatch',
+            FLAG_PATCH_DETOOLS: 'detools'}.get(beacon['patch_flag'])
 
 
 def assert_flasher_face_present(image: bytes, label: str, allow_missing: bool):
-    """Abort unless `image` (the assembled firmware bytes) looks like it contains
-    the firmware_flasher_face, so we never flash away the ability to re-flash."""
-    found = sorted(m.decode() for m in FLASHER_FACE_MARKERS if m in image)
-    if len(found) >= FLASHER_FACE_MARKERS_MIN:
+    """Abort unless `image` (the assembled firmware bytes) carries the flasher
+    beacon, so we never flash away the ability to re-flash."""
+    if find_flasher_beacon(image) is not None:
         return
-    msg = (f"{label} does not appear to contain the firmware_flasher_face "
-           f"(matched {len(found)}/{len(FLASHER_FACE_MARKERS)} of its markers"
-           f"{': ' + ', '.join(found) if found else ''}; need "
-           f"{FLASHER_FACE_MARKERS_MIN}). Flashing it would leave the watch unable "
-           f"to receive another IR flash; the only recovery would be USB UF2.")
+    msg = (f"{label} does not contain the firmware_flasher beacon. Either the "
+           f"firmware_flasher_face is missing (flashing it would leave the watch "
+           f"unable to receive another IR flash; the only recovery would be USB "
+           f"UF2) or the image predates the beacon.")
     if allow_missing:
         print(f"WARNING: {msg}\n         Proceeding anyway (--allow-no-flasher-face).")
     else:
@@ -160,6 +168,14 @@ def send_frame_and_wait_ack(modem: Modem, frame: bytes, frame_id: int,
                             data_baud: int, ack_timeout: float) -> bool:
     """Send one frame, then wait for the 2-byte id echo. True on ACK."""
     expected = struct.pack('<H', frame_id)
+    # Discard stale messages from earlier attempts. A late ACK left in the
+    # pipe would otherwise match instantly, putting the host a CMD_TX ahead of
+    # the modem for good: the modem then always has a command queued, never
+    # opens its RX window, and no ACK is ever heard again. Message-level
+    # discard, not reset_input_buffer(), which can cut a message in half
+    # mid-arrival and desync the SOF parser.
+    while modem.read_message(time.time() + 0.01) is not None:
+        pass
     # Flasher always wants the reply, so AUTO_RX (flip to RX) on every frame.
     modem.send(CMD_TX, bytes((TX_FLAG_AUTO_RX,)) + frame)
 
@@ -169,16 +185,24 @@ def send_frame_and_wait_ack(modem: Modem, frame: bytes, frame_id: int,
     deadline = time.time() + tx_estimate + ack_timeout + 1.0
     rx_log = bytearray()      # everything the modem decoded this attempt (debug)
     window = bytearray()      # rolling tail of recently received optical bytes
+    # Count ACK bytes only after this attempt's TX_DONE. No real ACK can be
+    # lost: the modem enters RX before reporting TX_DONE and the USB stream is
+    # ordered, so a genuine reply always follows it; optical bytes ahead of it
+    # are a previous attempt's leftovers.
+    tx_done = False
     while time.time() < deadline:
         msg = modem.read_message(deadline)
         if msg is None:
             break
         mtype, payload = msg
         if mtype == MSG_TX_DONE:
+            tx_done = True
             deadline = time.time() + ack_timeout      # start the tight ack window
         elif mtype == MSG_RX:
             if DEBUG:
                 rx_log += payload
+            if not tx_done:
+                continue
             window += payload
             if expected in window:
                 if DEBUG:
@@ -340,12 +364,13 @@ def assemble_image(blocks):
 
 # --- patch (delta) flash --------------------------------------------------- *
 #
-# When --reference is given we diff the new UF2 against the reference (the
-# firmware currently on the watch) with detools (in-place, crle, the only
-# decompressor the watch has), strip the detools header into the patch ENTER, and
-# stream the compressed body as FLAG_PATCH frames. The watch verifies its flash
-# matches the reference before applying, reconstructs NEW in place, then the EXIT
-# CRC gates the reboot. See the watch-side firmware_flasher_ramfunc.c.
+# When --reference is given we build a delta of the new UF2 against the
+# reference (the firmware currently on the watch) in the watch's compiled-in
+# format -- UltraPatch by default, detools crle for FIRMWARE_FLASHER_ULTRAPATCH=0
+# builds (--patch-format) -- and stream the compressed body as patch frames
+# carrying that dialect's flag bit. The watch verifies its flash matches the reference before applying,
+# reconstructs NEW in place, then the EXIT CRC gates the reboot. See
+# second-movement/firmware-flasher/.
 
 def _image_bytes(uf2_path):
     """Parse a UF2 -> (base, image_bytes, image_crc32) via the same gap-free,
@@ -400,6 +425,67 @@ def build_patch(detools, ref_image, new_image, from_r, window):
     return shift_size, from_size, to_size, f.read(), len(patch)
 
 
+def find_ultrapatch_tool(arg_path):
+    """Locate (building on demand) the UltraPatch host CLI. Order: the
+    --ultrapatch-tool flag, $ULTRAPATCH_TOOL, then `make` in an UltraPatch
+    checkout at $ULTRAPATCH_PATH or as a sibling of this repo."""
+    import subprocess
+    cand = arg_path or os.environ.get('ULTRAPATCH_TOOL')
+    if cand:
+        if not os.path.isfile(cand) or not os.access(cand, os.X_OK):
+            sys.exit(f"error: ultrapatch tool not executable: {cand}")
+        return cand
+    repo = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    up = os.environ.get('ULTRAPATCH_PATH') or os.path.join(repo, 'ultrapatch')
+    if not os.path.isfile(os.path.join(up, 'Makefile')):
+        sys.exit(f"error: no UltraPatch sources at {up}. If this is a fresh "
+                 f"clone, run: git submodule update --init ultrapatch  (or set "
+                 f"ULTRAPATCH_PATH / $ULTRAPATCH_TOOL / --ultrapatch-tool)")
+    try:
+        subprocess.run(['make', '-C', up, '-s'], check=True)
+        tool = subprocess.run(['make', '-C', up, '-s', 'host-tool-path'],
+                              check=True, capture_output=True, text=True).stdout.strip()
+    except (subprocess.CalledProcessError, OSError) as e:
+        sys.exit(f"error: building the UltraPatch CLI in {up} failed: {e}")
+    return tool
+
+
+def build_ultrapatch(tool, ref_image, new_image):
+    """Build an UltraPatch patch with the host CLI and SELF-CHECK it by applying
+    with the same production decoder (--decode) and comparing byte-for-byte.
+    Images are already row-aligned (assemble_image emits whole rows), so the
+    envelope's from/to sizes match what the watch's flash and EXIT verify use.
+    The WHOLE blob (envelope + body) streams as the patch body; shift_size does
+    not exist in this format (the ENTER carries 0). Returns the blob."""
+    import subprocess
+    import tempfile
+    with tempfile.TemporaryDirectory() as td:
+        rp = os.path.join(td, 'ref.bin')
+        np_ = os.path.join(td, 'new.bin')
+        pp = os.path.join(td, 'up.patch')
+        cp = os.path.join(td, 'check.bin')
+        with open(rp, 'wb') as f:
+            f.write(ref_image)
+        with open(np_, 'wb') as f:
+            f.write(new_image)
+        try:
+            subprocess.run([tool, rp, np_, pp], check=True, capture_output=True)
+        except subprocess.CalledProcessError as e:
+            sys.exit(f"error: ultrapatch encode failed: {e.stderr.decode(errors='replace')}")
+        with open(rp, 'rb') as f, open(cp, 'wb') as g:
+            g.write(f.read())
+        try:
+            subprocess.run([tool, '--decode', cp, pp], check=True, capture_output=True)
+        except subprocess.CalledProcessError as e:
+            sys.exit(f"error: ultrapatch self-check decode failed: {e.stderr.decode(errors='replace')}")
+        with open(cp, 'rb') as f:
+            if f.read() != new_image:
+                sys.exit("error: ultrapatch self-check mismatch (decoder did not "
+                         "reproduce the new image); not flashing")
+        with open(pp, 'rb') as f:
+            return f.read()
+
+
 def send_blocks(modem: Modem, send_rows, args):
     """Send the selected rows as data blocks (targetAddr + 256), stop-and-wait.
     Each row is (abs_idx, addr, row); the frame id is the absolute index. The
@@ -415,9 +501,8 @@ def send_blocks(modem: Modem, send_rows, args):
 def flash_stage(modem: Modem, base, total_length, image_crc, send_rows, args,
                 *, arm, restartable):
     """Drive the real flash: optional ENTER (arm) -> the selected blocks ->
-    EXIT. The EXIT frame carries the whole-image descriptor and is always sent
-    (it doubles as the end-to-end test in a dry run: the watch fakes a pass and
-    reboots). On a failed final check the watch stays in its RAM flasher (it never
+    EXIT. The EXIT frame carries the whole-image descriptor and is always sent.
+    On a failed final check the watch stays in its RAM flasher (it never
     reboots into a half-written image).
 
     `arm`: send the ENTER frame first; true when the watch is still in its TEST
@@ -459,11 +544,14 @@ def flash_stage(modem: Modem, base, total_length, image_crc, send_rows, args,
 
 
 def patch_flash(args, base, from_size, to_size, ref_crc, new_crc, shift_size, body,
-                new_image):
+                new_image, fmt_ultra=False):
     """Drive a delta-patch flash: handshake -> link test (patch frames) -> patch
     ENTER (the watch ACKs only if its flash matches the reference) -> stream the
-    crle body -> EXIT (verify NEW + reboot). Mirrors the full-flash flow but with
-    FLAG_PATCH frames and the patch ENTER.
+    compressed body -> EXIT (verify NEW + reboot). Mirrors the full-flash flow but
+    with patch frames and the patch ENTER, both carrying the session dialect's
+    flag bit. `fmt_ultra` selects the UltraPatch body format: shift_size is 0 and
+    the body is the whole UltraPatch blob; everything else on the wire is
+    identical.
 
     `new_image` is the full row-aligned new firmware (the same bytes the patch
     reconstructs). If the EXIT verify fails, the in-place patch has consumed the
@@ -491,12 +579,16 @@ def patch_flash(args, base, from_size, to_size, ref_crc, new_crc, shift_size, bo
     print(f"ref:      {args.reference}")
     print(f"device:   {args.device}")
     print(f"patch:    {len(body)} body bytes -> {num} frame(s)  "
-          f"(crle, in-place; vs {to_size} B full image)")
+          f"({'ultrapatch' if fmt_ultra else 'crle'}, in-place; vs {to_size} B full image)")
     if resume:
         print(f"send:     chunks {start}..{num - 1} ({num - start} of {num})  "
               f"[RESUME: no test/ENTER]")
-    print(f"window:   shift_size {shift_size} B (watch aux RAM, or in-flash shift "
-          f"if it won't fit)   from {from_size} / to {to_size}")
+    if fmt_ultra:
+        print(f"geometry: from {from_size} / to {to_size} (ultrapatch: no shift; "
+              f"the watch allocates its decoder state from heap)")
+    else:
+        print(f"window:   shift_size {shift_size} B (watch aux RAM, or in-flash shift "
+              f"if it won't fit)   from {from_size} / to {to_size}")
     print(f"crc:      ref 0x{ref_crc:08X}  new 0x{new_crc:08X}")
     print(f"baud:     data {args.baud} / ack {args.ack_baud}  encoding {args.encoding}"
           f"  rx={'digital' if args.digital_rx else 'analog'}")
@@ -520,8 +612,9 @@ def patch_flash(args, base, from_size, to_size, ref_crc, new_crc, shift_size, bo
             # no ENTER — just confirm and pick the stream up at `start`. The watch's
             # stop-and-wait dedup accepts last_id+1, so it is waiting for `start`.
             try:
+                same = "THIS patch" if fmt_ultra else f"a run with THIS shift ({shift_size} B)"
                 ans = input(f"RESUME patch at chunk {start}/{num}: the watch must already "
-                            f"be mid-patch from a run with THIS shift ({shift_size} B). "
+                            f"be mid-patch from {same}. "
                             f"Resume now? [y/N] ").strip().lower()
             except (EOFError, KeyboardInterrupt):
                 ans = 'n'
@@ -558,15 +651,18 @@ def patch_flash(args, base, from_size, to_size, ref_crc, new_crc, shift_size, bo
             # never-arriving ACK means the watch's firmware does not match --reference
             # (or the link is down). Watch the reply blink and Ctrl-C if it never comes.
             desc = struct.pack('<IIIII', base, from_size, ref_crc, to_size, shift_size)
-            enter = build_frame(desc, FRAME_ID_ENTER, FLAG_ENTER | FLAG_PATCH | FLAG_VERIFY)
+            patch_flag = FLAG_PATCH_ULTRA if fmt_ultra else FLAG_PATCH_DETOOLS
+            enter = build_frame(desc, FRAME_ID_ENTER, FLAG_ENTER | patch_flag | FLAG_VERIFY)
             print("sending patch ENTER (watch ACKs only if its flash matches the "
                   "reference; Ctrl-C if it never ACKs: wrong --reference or dead link)...")
             send_enter(modem, enter, args, "ENTER(patch)")
             print("reference verified; flasher armed (point of no return on the watch "
                   "once the first frame lands).")
 
-        # Stream the crle body as FLAG_PATCH frames (ids start..N-1).
-        patch_items = [(i & 0xFFFF, build_frame(chunks[i], i & 0xFFFF, FLAG_PATCH),
+        # Stream the compressed body as patch frames (ids start..N-1), in this
+        # session's dialect bit.
+        patch_flag = FLAG_PATCH_ULTRA if fmt_ultra else FLAG_PATCH_DETOOLS
+        patch_items = [(i & 0xFFFF, build_frame(chunks[i], i & 0xFFFF, patch_flag),
                         f"frame {i} (id {i & 0xFFFF})  [{i - start + 1}/{num - start}]")
                        for i in range(start, num)]
         stream_frames(modem, patch_items, args, "frame")
@@ -648,8 +744,8 @@ def main():
                    help="How many blocks to send, starting at --start-block (default: "
                         "all remaining). Use a small value to exercise the link quickly "
                         "without sending the whole image; the final VERIFY is still "
-                        "requested (in a dry run the watch fakes a pass and reboots, "
-                        "giving a full end-to-end test).")
+                        "requested (it will fail on a partial image and the watch "
+                        "stays in its flasher).")
     p.add_argument('--reference', metavar='REF.uf2',
                    help="The firmware CURRENTLY on the watch. If given, flash a delta "
                         "PATCH of <file> against it (much less to send) instead of the "
@@ -659,7 +755,19 @@ def main():
                    help="Aux-window size (= detools shift_size, the watch RAM the patch "
                         "needs) for the interactive prompt's option 1. Clamped up to the "
                         "minimum the patch needs. Omit to default to 2048 B. Bigger = a "
-                        "marginally smaller patch for more watch RAM.")
+                        "marginally smaller patch for more watch RAM. detools format only.")
+    p.add_argument('--patch-format', choices=['detools', 'ultrapatch'], default=None,
+                   help="Delta format for --reference; must match the watch build. "
+                        "Omit to auto-detect from the reference firmware's beacon; "
+                        "REQUIRED when the reference predates the beacon (no default). "
+                        "Contradicting the beacon prompts for confirmation. A mismatch "
+                        "is safe: the watch silently refuses the patch ENTER and "
+                        "nothing is written.")
+    p.add_argument('--ultrapatch-tool', metavar='PATH', default=None,
+                   help="Path to the UltraPatch host CLI. Omit to use $ULTRAPATCH_TOOL, "
+                        "or to build it via make in $ULTRAPATCH_PATH (default: this "
+                        "repo's `ultrapatch` submodule; keep its pin in step with the "
+                        "watch firmware's).")
     p.add_argument('--allow-no-flasher-face', action='store_true',
                    help="Skip the safety check that the UF2 still contains the "
                         "firmware_flasher_face. Flashing a firmware without it means "
@@ -692,11 +800,6 @@ def main():
             sys.exit(f"error: reference file not found: {args.reference}")
         if args.start_block is not None and args.start_block < 0:
             sys.exit(f"error: --start-block must be >= 0, got {args.start_block}")
-        try:
-            import detools  # noqa: F401
-        except ImportError:
-            sys.exit("error: --reference patch flashing needs detools (pip install detools, "
-                     "or use this repo's .venv/bin/python).")
         rbase, ref_img, ref_crc = _image_bytes(args.reference)
         nbase, new_img, new_crc = _image_bytes(args.file)
         # Guard the NEW image (what ends up on the watch); refuse a firmware that
@@ -704,6 +807,84 @@ def main():
         assert_flasher_face_present(new_img, args.file, args.allow_no_flasher_face)
         if rbase != nbase:
             sys.exit(f"error: reference base 0x{rbase:08X} != new base 0x{nbase:08X}")
+
+        # Patch dialect: the REFERENCE image is what's on the watch, so its
+        # beacon is ground truth for the format this session must speak. There
+        # is deliberately NO default: a beacon-less (pre-beacon) reference
+        # requires an explicit --patch-format, and an explicit flag that
+        # contradicts the beacon is confirmed interactively (default abort).
+        ref_beacon = find_flasher_beacon(ref_img)
+        ref_dialect = beacon_dialect(ref_beacon)
+        if ref_beacon is not None and ref_dialect is None:
+            sys.exit(f"error: the reference firmware speaks an unknown patch dialect "
+                     f"(beacon patch_flag 0x{ref_beacon['patch_flag']:02X}, version "
+                     f"{ref_beacon['version']}); update this tool.")
+        if args.patch_format and ref_dialect and args.patch_format != ref_dialect:
+            print(f"WARNING: --patch-format {args.patch_format} contradicts the "
+                  f"reference firmware's beacon ({ref_dialect}); the watch will "
+                  f"almost certainly refuse the patch ENTER.")
+            try:
+                ans = input(f"Proceed with '{args.patch_format}' anyway? [y/N] ").strip().lower()
+            except (EOFError, KeyboardInterrupt):
+                ans = 'n'
+            if ans != 'y':
+                sys.exit("aborted.")
+            fmt = args.patch_format
+        elif args.patch_format:
+            fmt = args.patch_format
+        elif ref_dialect:
+            fmt = ref_dialect
+            print(f"patch format: {fmt} (auto, from the reference firmware's beacon)")
+        else:
+            sys.exit("error: the reference firmware predates the beacon, so the patch "
+                     "format cannot be auto-detected; pass --patch-format "
+                     "{detools,ultrapatch} explicitly (it must match the watch's "
+                     "current firmware build).")
+        new_dialect = beacon_dialect(find_flasher_beacon(new_img))
+        if new_dialect and new_dialect != fmt:
+            print(f"note: after this flash the watch will speak '{new_dialect}' "
+                  f"(auto-detected from then on).")
+
+        if fmt == 'ultrapatch':
+            # UltraPatch: one patch, no window/shift menu (the decoder state is a
+            # fixed-size heap allocation on the watch). The CLI self-check in
+            # build_ultrapatch already proved the blob reproduces the new image.
+            tool = find_ultrapatch_tool(args.ultrapatch_tool)
+            body = build_ultrapatch(tool, ref_img, new_img)
+            full_len = len(new_img)
+            nup = (len(body) + ROW_SIZE - 1) // ROW_SIZE
+            nfull = full_len // ROW_SIZE
+            default = '1' if len(body) < full_len else '3'
+            rows = [
+                ('1', "Ultrapatch", len(body), nup),
+                ('3', "Full",       full_len,  nfull),
+            ]
+            lw = max(len(r[1]) for r in rows)
+            sw = max(len(str(r[2])) for r in rows)
+            cw = max(len(str(r[3])) for r in rows)
+            print(f"\npatch {args.file} vs {args.reference}:")
+            for key, label, size, chunks in rows:
+                print(f"  [{key}] {label:<{lw}}  | Size: {size:>{sw}} B | Chunks: {chunks:>{cw}}")
+            print("  [q] abort")
+            try:
+                choice = input(f"choose [1/3/q] (default {default}): ").strip().lower() or default
+            except (EOFError, KeyboardInterrupt):
+                choice = 'q'
+            if choice == '1':
+                patch_flash(args, nbase, len(ref_img), len(new_img), ref_crc, new_crc,
+                            0, body, new_img, fmt_ultra=True)
+                return
+            elif choice != '3':
+                print("aborted.")
+                return
+            # choice '3': fall through to the full-flash path below
+
+    if args.reference and fmt == 'detools':
+        try:
+            import detools  # noqa: F401
+        except ImportError:
+            sys.exit("error: --reference patch flashing needs detools (pip install detools, "
+                     "or use this repo's .venv/bin/python).")
         from_r, _growth, min_shift, max_window = patch_geometry(
             nbase, len(ref_img), len(new_img))
 
