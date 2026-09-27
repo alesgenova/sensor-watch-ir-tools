@@ -18,6 +18,10 @@ pio run -e modem_arduino_uno -t upload
 pio run -e modem_xiao_samd21 -t upload
 ```
 
+The repository's development tools are installed in `.venv`; invoke them by
+activating it or by their explicit paths (for example, `.venv/bin/pio`) rather
+than relying on a system-wide installation.
+
 The last two commands build and upload the selected modem. Run `sh flasher-sim/run.sh` for the full hosted flasher integration suite; it requires GCC, a sibling `second-movement` checkout, and may create a local `flasher-sim/venv`. Success ends in `ALL PASS` for every backend.
 
 ## Coding Style & Naming Conventions

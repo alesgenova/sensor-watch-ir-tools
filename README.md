@@ -42,6 +42,8 @@ that matches your board, plug it in over USB, and upload:
 pio run -e modem_arduino_uno  -t upload     # Arduino UNO
 # or
 pio run -e modem_xiao_samd21  -t upload     # Seeed XIAO SAMD21
+# or
+pio run -e modem_esp32c3      -t upload     # ESP32-C3-DevKitM-1
 ```
 
 Both modems are **identical from the host's point of view**: the Python script talks to
@@ -86,11 +88,15 @@ Parts used in the prototype rig:
 
 Pins to use on the MCU with the provided modem firmware:
 
-|             | XIAO Pin | UNO Pin |
-|-------------|----------|---------|
-| VCC         | 3.3V     | 5V      |
-| TX (IR LED) | D10      | D9      |
-| RX (PT)     | D8       | A0 or D8 (digital-rx)|
+|             | XIAO Pin | UNO Pin | ESP32-C3-DevKitM-1 Pin |
+|-------------|----------|---------|------------------------|
+| VCC         | 3.3V     | 5V      | 3V3 |
+| TX (IR LED) | D10      | D9      | GPIO7 |
+| RX (PT)     | D8       | A0 or D8 (digital-rx)| GPIO4 |
+
+On the ESP32-C3-DevKitM-1, GPIO4 is ADC1_CH4 and GPIO7 is a regular exposed
+GPIO. This deliberately avoids GPIO2, GPIO8, and GPIO9 (boot strapping pins),
+GPIO12--GPIO17 (flash signals), and GPIO18/GPIO19 (USB-JTAG).
 
 
 <p>

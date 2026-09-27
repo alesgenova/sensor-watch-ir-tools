@@ -70,6 +70,16 @@ RX_ANALOG  = 1
 HANDSHAKE_BAUD = 115200
 RESET_DELAY_S  = 2.0
 
+# ESP32-C3's native USB Serial/JTAG driver has a 256-byte RX ring by default,
+# smaller than a maximum modem command (~545 bytes). Unlike an ordinary UART,
+# USB can deliver the whole pyserial write before the sketch gets a chance to
+# drain that ring. Feed commands in USB packet-sized chunks so every supported
+# board can parse a full CMD_TX without losing its tail. The 2 ms yield is
+# insignificant beside a multi-hundred-ms IR frame, and is harmless on UART or
+# native-USB boards with larger buffers.
+USB_WRITE_CHUNK = 64
+USB_WRITE_GAP_S = 0.002
+
 
 def enc_byte(encoding: str) -> int:
     """'irda' -> ENC_IRDA, anything else -> ENC_NRZ."""
@@ -83,8 +93,12 @@ class Modem:
 
     def send(self, cmd: int, payload: bytes = b''):
         hdr = bytes((USB_SOF, cmd, len(payload) & 0xFF, (len(payload) >> 8) & 0xFF))
-        self.ser.write(hdr + payload)
-        self.ser.flush()
+        data = hdr + payload
+        for offset in range(0, len(data), USB_WRITE_CHUNK):
+            self.ser.write(data[offset:offset + USB_WRITE_CHUNK])
+            self.ser.flush()
+            if offset + USB_WRITE_CHUNK < len(data):
+                time.sleep(USB_WRITE_GAP_S)
 
     def drain(self):
         """Discard any buffered input (OS receive buffer + our parse buffer).
