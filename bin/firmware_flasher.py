@@ -80,6 +80,8 @@ BOOTLOADER_END          = 0x2000   # SAM L22 UF2 bootloader occupies [0, 0x2000)
 # (= the watch's tx baud).
 DEFAULT_DATA_BAUD = 3600
 DEFAULT_ACK_BAUD  = 300
+DEFAULT_ACK_TIMEOUT = 2.0
+DEFAULT_PATCH_TIMEOUT = 30.0
 
 
 def parse_uf2(data: bytes):
@@ -278,11 +280,12 @@ def send_enter(modem: Modem, enter_frame: bytes, args, label: str = "ENTER"):
                       None, label)   # None = retry until ACKed
 
 
-def stream_frames(modem: Modem, items, args, noun: str):
+def stream_frames(modem: Modem, items, args, noun: str, timeout: float = None):
     """Stream data frames stop-and-wait, each retransmitted FOREVER until ACKed
     (once flashing has begun the watch stays in its flasher; Ctrl-C aborts a
     dead link). `items` is a list of (frame_id, frame_bytes, label); `noun`
-    labels the progress line. Returns the total retransmission count."""
+    labels the progress line. `timeout` overrides the ordinary per-frame ACK
+    wait for work that takes longer on the watch. Returns the retransmission count."""
     total = len(items)
     t0 = time.time()
     last_report = t0
@@ -290,7 +293,8 @@ def stream_frames(modem: Modem, items, args, noun: str):
     for i, (frame_id, frame, label) in enumerate(items):
         if i > 0:
             time.sleep(args.settle)            # let the watch reopen RX after the prev ACK
-        total_retx += send_with_retries(modem, frame, frame_id, args.baud, args.timeout,
+        total_retx += send_with_retries(modem, frame, frame_id, args.baud,
+                                        args.timeout if timeout is None else timeout,
                                         None, label)   # None = retry until ACKed
         now = time.time()
         if now - last_report >= 1.0 or i == total - 1:
@@ -592,6 +596,7 @@ def patch_flash(args, base, from_size, to_size, ref_crc, new_crc, shift_size, bo
     print(f"crc:      ref 0x{ref_crc:08X}  new 0x{new_crc:08X}")
     print(f"baud:     data {args.baud} / ack {args.ack_baud}  encoding {args.encoding}"
           f"  rx={'digital' if args.digital_rx else 'analog'}")
+    print(f"ack wait: ENTER {args.timeout:g}s / patch frame {args.patch_timeout:g}s")
 
     try:
         ser = serial.Serial(args.device, baudrate=HANDSHAKE_BAUD, timeout=0.1)
@@ -620,7 +625,7 @@ def patch_flash(args, base, from_size, to_size, ref_crc, new_crc, shift_size, bo
                 ans = 'n'
             if ans != 'y':
                 print("not resuming.")
-                modem.send(CMD_STOP); ser.close(); return
+                modem.send(CMD_STOP); ser.close(); return False
         else:
             # Link-reliability test: first M body chunks flagged TEST (watch ACKs, does
             # not commit). Same gate as the full flash; needs the watch in TEST mode.
@@ -630,12 +635,12 @@ def patch_flash(args, base, from_size, to_size, ref_crc, new_crc, shift_size, bo
                     input("Put the watch in flash TEST mode (FLASH menu -> Alarm), then "
                           "press Enter to start the link test (Ctrl-C to abort)... ")
                 except (EOFError, KeyboardInterrupt):
-                    print("\naborted"); modem.send(CMD_STOP); ser.close(); return
+                    print("\naborted"); modem.send(CMD_STOP); ser.close(); return False
                 run_test_stage(modem, chunks[:m], "frame", args)
 
             if args.test_only:
                 print("test-only: done.")
-                modem.send(CMD_STOP); ser.close(); return
+                modem.send(CMD_STOP); ser.close(); return False
 
             try:
                 ans = input("POINT OF NO RETURN: the watch will be unresponsive until a "
@@ -644,7 +649,7 @@ def patch_flash(args, base, from_size, to_size, ref_crc, new_crc, shift_size, bo
                 ans = 'n'
             if ans != 'y':
                 print("not flashing.")
-                modem.send(CMD_STOP); ser.close(); return
+                modem.send(CMD_STOP); ser.close(); return False
 
             # Patch ENTER: {base, from_size, ref_crc, to_size, shift_size}. The watch
             # ACKs ONLY if its flash over [base,base+from_size) CRCs to ref_crc, so a
@@ -665,11 +670,13 @@ def patch_flash(args, base, from_size, to_size, ref_crc, new_crc, shift_size, bo
         patch_items = [(i & 0xFFFF, build_frame(chunks[i], i & 0xFFFF, patch_flag),
                         f"frame {i} (id {i & 0xFFFF})  [{i - start + 1}/{num - start}]")
                        for i in range(start, num)]
-        stream_frames(modem, patch_items, args, "frame")
+        stream_frames(modem, patch_items, args, "frame", timeout=args.patch_timeout)
 
         # EXIT: {base, to_size, new_crc}. The watch CRCs the reconstructed image and,
         # only on a match, echoes this id and reboots into the new firmware.
-        if not send_exit_verify(modem, base, to_size, new_crc, args):
+        if send_exit_verify(modem, base, to_size, new_crc, args):
+            return True
+        else:
             print("\nNo EXIT ACK. Either the reconstructed image's CRC did not match "
                   "(the watch is still in its flasher), or it verified and already "
                   "rebooted into the new firmware (echo lost), in which case it's fine.")
@@ -689,13 +696,15 @@ def patch_flash(args, base, from_size, to_size, ref_crc, new_crc, shift_size, bo
                 # arm=False: the watch is already in its flasher (no TEST stage, no
                 # ENTER). restartable=True: these blocks start at id 0, so a failed
                 # verify can re-stream from the top like any full flash.
-                flash_stage(modem, base, len(new_image), new_crc, fb_rows, args,
-                            arm=False, restartable=True)
+                return flash_stage(modem, base, len(new_image), new_crc, fb_rows, args,
+                                   arm=False, restartable=True)
             else:
                 print("not falling back. If the watch is stuck, re-run with a full "
                       "flash (omit --reference).")
+                return False
     except KeyboardInterrupt:
         print("\ninterrupted")
+        return False
     finally:
         modem.send(CMD_STOP)
         ser.close()
@@ -717,8 +726,13 @@ def main():
     p.add_argument('--digital-rx', action='store_true',
                    help="Use digital edge-detection RX instead of the default "
                         "analog polled RX. Faster, but needs a strong, clean signal.")
-    p.add_argument('--timeout', type=float, default=0.5,
-                   help="Per-frame ACK timeout in seconds. Default: 0.5")
+    p.add_argument('--timeout', type=float, default=DEFAULT_ACK_TIMEOUT,
+                   help=f"ACK timeout for TEST, ENTER, full-flash blocks and EXIT (s). "
+                        f"Default: {DEFAULT_ACK_TIMEOUT:g}")
+    p.add_argument('--patch-timeout', type=float, default=DEFAULT_PATCH_TIMEOUT,
+                   help=f"ACK timeout for patch body frames (s). The watch may decode "
+                        f"and verify the image before ACKing the final frame. "
+                        f"Default: {DEFAULT_PATCH_TIMEOUT:g}")
     p.add_argument('--retries', type=int, default=50,
                    help="Max retransmissions for a test/control frame before aborting "
                         "(data blocks are retried forever). Default: 50")
@@ -789,6 +803,8 @@ def main():
     for b in (args.baud, args.ack_baud):
         if not (50 <= b <= 115200):
             sys.exit(f"error: baud must be in [50, 115200], got {b}")
+    if args.timeout <= 0 or args.patch_timeout <= 0:
+        sys.exit("error: --timeout and --patch-timeout must be > 0")
     if args.test_blocks < 0:
         sys.exit("error: --test-blocks must be >= 0")
     if not os.path.isfile(args.file):
@@ -871,12 +887,11 @@ def main():
             except (EOFError, KeyboardInterrupt):
                 choice = 'q'
             if choice == '1':
-                patch_flash(args, nbase, len(ref_img), len(new_img), ref_crc, new_crc,
-                            0, body, new_img, fmt_ultra=True)
-                return
+                return patch_flash(args, nbase, len(ref_img), len(new_img), ref_crc, new_crc,
+                                   0, body, new_img, fmt_ultra=True)
             elif choice != '3':
                 print("aborted.")
-                return
+                return False
             # choice '3': fall through to the full-flash path below
 
     if args.reference and fmt == 'detools':
@@ -921,16 +936,14 @@ def main():
             choice = 'q'
 
         if choice == '1':
-            patch_flash(args, nbase, f1, t1, ref_crc, new_crc, s1, body1, new_img)
-            return
+            return patch_flash(args, nbase, f1, t1, ref_crc, new_crc, s1, body1, new_img)
         elif choice == '2':
-            patch_flash(args, nbase, f2, t2, ref_crc, new_crc, s2, body2, new_img)
-            return
+            return patch_flash(args, nbase, f2, t2, ref_crc, new_crc, s2, body2, new_img)
         elif choice == '3':
             pass   # fall through to the full-flash path below
         else:
             print("aborted.")
-            return
+            return False
 
     with open(args.file, 'rb') as f:
         data = f.read()
@@ -1020,7 +1033,7 @@ def main():
                   "press Enter to start the link test (Ctrl-C to abort)... ")
         except (EOFError, KeyboardInterrupt):
             print("\naborted")
-            modem.send(CMD_STOP); ser.close(); return
+            modem.send(CMD_STOP); ser.close(); return False
         try:
             run_test_stage(modem, [b[2] for b in blocks[:m]], "block", args)
         except KeyboardInterrupt:
@@ -1028,13 +1041,13 @@ def main():
             # and the XIAO won't reset on the next run's port open, so a stuck-in-RX
             # modem would stream diagnostics into that run's handshake.
             print("\ninterrupted")
-            modem.send(CMD_STOP); ser.close(); return
+            modem.send(CMD_STOP); ser.close(); return False
 
     if args.test_only:
         print("test-only: done.")
         modem.send(CMD_STOP)
         ser.close()
-        return
+        return False
 
     # Confirm before the real flash: explicit 'y', defaulting to No. This is the
     # point of no return; the watch goes unresponsive until a flash completes.
@@ -1047,19 +1060,20 @@ def main():
         print("not flashing.")
         modem.send(CMD_STOP)
         ser.close()
-        return
+        return False
 
     print("flashing...")
     send_rows = [(idx, rows[idx][0], rows[idx][1]) for idx in range(start, end)]
     try:
-        flash_stage(modem, base, total_length, image_crc, send_rows, args,
-                    arm=arm, restartable=restartable)
+        return flash_stage(modem, base, total_length, image_crc, send_rows, args,
+                           arm=arm, restartable=restartable)
     except KeyboardInterrupt:
         print("\ninterrupted")
+        return False
     finally:
         modem.send(CMD_STOP)
         ser.close()
 
 
 if __name__ == '__main__':
-    main()
+    sys.exit(0 if main() else 1)
