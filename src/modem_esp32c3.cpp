@@ -5,8 +5,9 @@
 // this firmware only turns bytes into light and light back into bytes. GPIO7 is
 // the active-high IR LED output; GPIO4 is the active-low, idle-high PT input.
 // GPIO4 is ADC1_CH4, so the default analog receive mode and --digital-rx both
-// use the same wire. Both pins are exposed by DevKitM-1 and avoid strapping,
-// flash, and USB-JTAG pins.
+// use the same wire. GPIO7 is a regular exposed GPIO. Both pins are exposed by
+// DevKitM-1; the pinout avoids GPIO2/GPIO8/GPIO9 (boot strapping),
+// GPIO12-GPIO17 (flash signals), and GPIO18/GPIO19 (USB-JTAG).
 //
 // TX uses the C3's RMT peripheral as its bit clock, matching the hardware-timed
 // approach of the UNO and XIAO modems. RX is a non-blocking,

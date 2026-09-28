@@ -15,6 +15,9 @@ The host tooling here pairs with the watch-side faces that can be found at the *
 - `ir_rx_face` and `test_tx.py` to test out sending data to the watch
 - `ir_tx_face` and `test_rx.py` to test out receiveing data from the watch
 
+For an interactive explanation of the watch's memory map and the IR update
+sequence, open [docs/index.html](docs/index.html) in a browser.
+
 ---
 
 ## 1. Get the code and run the flasher
@@ -94,11 +97,6 @@ Pins to use on the MCU with the provided modem firmware:
 | TX (IR LED) | D10      | D9      | GPIO7 |
 | RX (PT)     | D8       | A0 or D8 (digital-rx)| GPIO4 |
 
-On the ESP32-C3-DevKitM-1, GPIO4 is ADC1_CH4 and GPIO7 is a regular exposed
-GPIO. This deliberately avoids GPIO2, GPIO8, and GPIO9 (boot strapping pins),
-GPIO12--GPIO17 (flash signals), and GPIO18/GPIO19 (USB-JTAG).
-
-
 <p>
   <img src="img/flasher_v2_board.jpg" alt="The flasher prototype board: XIAO SAMD21 + IR LED + Phototransistor" width="32%">
   <img src="img/flasher_v2_enclosure.jpg" alt="The flasher prototype in its enclosure, with windows for the IR LED and Phototransistor" width="32%">
@@ -118,7 +116,8 @@ These were found by hardware testing and are the script's and watch face default
 | `--encoding` | `nrz` | line coding, both directions |
 | `--baud` | `3600` | data, host → watch (watch RX baud) |
 | `--ack-baud` | `300` | ACK, watch → host (watch TX baud) |
-| `--timeout` | `0.5` | per-frame ACK timeout (s) |
+| `--timeout` | `2.0` | ACK timeout for TEST, ENTER, full-flash blocks and EXIT (s) |
+| `--patch-timeout` | `30.0` | ACK timeout for patch body frames (s); the watch may need to finish decoding before replying |
 | `--settle` | `0.0` | host inter-frame delay (the watch's ACK settle does this) |
 
 **Watch (`firmware_flasher_face` menu):**
@@ -200,16 +199,16 @@ The original Digital RX implementation can be used with the `--digital-rx` optio
 
 2. **ENTER command.** Once the test passes, the host sends an `ENTER` frame (id
    `0xFFFF`, FLAG_ENTER, empty payload), retransmitting until it's ACKed. ENTER drops
-   the watch out of its normal Movement-scheduled test stage and hands control to the
-   RAM-resident flasher. The ACK is sent before the hand-off, so a lost ENTER-ACK just
-   makes the host resend, which is harmless; a repeated ENTER never re-enters the flasher.
+   the watch out of its test stage and into a wait-for-first-block stage. The first
+   data block hands control to the RAM-resident flasher. The ACK is sent before
+   that hand-off, so a lost ENTER-ACK just makes the host resend, which is harmless.
    *(With `--reference` the ENTER instead carries a 20-byte patch header, and the watch
    ACKs it only if its current flash matches the reference (otherwise the patch is
    refused); the data frames then stream a compressed delta applied in place.)*
 
-3. **RAM-resident flasher (`.ramfunc`).** While the flash controller is erasing or
+3. **RAM-resident flasher (overlay).** While the flash controller is erasing or
    programming a row, the CPU can't fetch instructions from flash, so the entire
-   flashing loop lives in a `.ramfunc` section copied to RAM at boot. On entry it
+   flashing loop lives in a RAM overlay copied from flash at first-block time. On entry it
    disables interrupts, closes the normal optical driver and brings the RX/TX SERCOMs
    up raw, disables the flash cache (so the read-back verify sees true flash), and
    sleeps in STANDBY between bytes. From here the watch is off Movement's event loop
@@ -227,7 +226,7 @@ The original Digital RX implementation can be used with the `--digital-rx` optio
    FLAG_VERIFY, a 12-byte descriptor = base address, total length, whole-image CRC-32).
    The watch CRCs the flash region it just wrote and compares. **Match** → it echoes the
    id and reboots straight into the new firmware. **Mismatch** → it stays silent and
-   parked in the `.ramfunc` (it never reboots into a half-written image), and the host
+   parked in the RAM overlay (it never reboots into a half-written image), and the host
    reports the failure and offers to resend. There is deliberately **no stall timeout**:
    an abandoned session just sits parked in RAM, still reachable over the link, rather
    than rebooting into a possibly-bricked image.
