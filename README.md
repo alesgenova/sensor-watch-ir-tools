@@ -116,8 +116,7 @@ These were found by hardware testing and are the script's and watch face default
 | `--encoding` | `nrz` | line coding, both directions |
 | `--baud` | `3600` | data, host → watch (watch RX baud) |
 | `--ack-baud` | `300` | ACK, watch → host (watch TX baud) |
-| `--timeout` | `2.0` | ACK timeout for TEST, ENTER, full-flash blocks and EXIT (s) |
-| `--patch-timeout` | `30.0` | ACK timeout for patch body frames (s); the watch may need to finish decoding before replying |
+| `--timeout` | `0.5` | per-frame ACK timeout (s) |
 | `--settle` | `0.0` | host inter-frame delay (the watch's ACK settle does this) |
 
 **Watch (`firmware_flasher_face` menu):**
