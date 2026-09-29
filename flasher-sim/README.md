@@ -29,6 +29,8 @@ is no extracted or duplicated watch code.
   6. corrupt patch body → park → full-flash recovery
   7. wrong base image → rejected before any flash write (ultrapatch mode only;
      detools guards this in the launcher's ENTER pre-flight instead)
+  8. first patch frame stored in the decoder's reused heap region → copied
+     before that region is cleared (ultrapatch mode only)
 
 Both decoder backends run: detools at three patch geometries (minimum shift,
 default, max window) and UltraPatch (the `FIRMWARE_FLASHER_ULTRAPATCH=1`

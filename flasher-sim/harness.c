@@ -21,6 +21,7 @@
  *   6. mid-apply takeover by a full flash + EXIT          -> reboot, image ==
  *   7. corrupt patch body -> park -> full-flash recovery  -> reboot, image ==
  *   8. wrong base image (ultrapatch only)                 -> reject before any write
+ *   9. first body frame aliases decoder state (ultrapatch) -> copy before reuse
  *
  * The fake flash lives in a MAP_32BIT mmap so the watch's uint32_t absolute
  * addresses are directly dereferenceable, exactly as on the SAM L22.
@@ -282,6 +283,22 @@ int main(void) {
     if (run_session(&pd, 0, 0, true, flen, body) != SESSION_REBOOT)
         { fprintf(stderr, "FAIL clean: no reboot\n"); return 1; }
     rc |= check_image(newi, to, "patch apply (clean)");
+
+#ifdef FIRMWARE_FLASHER_ULTRAPATCH
+    /* The watch's low-RAM fallback reuses Movement's heap for PatchApply.
+     * Its first patch frame may still live in that heap. flasher_run must
+     * copy the frame into its RAM-overlay buffer before the decoder zeroes
+     * PatchApply, or the first bytes of the patch disappear. */
+    assert(flen <= firmware_flasher_ultrapatch_state_size());
+    memcpy(aux, body, flen);
+    flash_reset(ref, (uint32_t)ref_len);
+    rx_clear(); g_rows_written = 0;
+    queue_body_frames(body, body_len, 0);
+    queue_exit_frame(0x7777, g_base, to, newcrc);
+    if (run_session(&pd, 0, 0, true, flen, aux) != SESSION_REBOOT)
+        { fprintf(stderr, "FAIL aliased first frame: no reboot\n"); return 1; }
+    rc |= check_image(newi, to, "patch apply (first frame aliases decoder state)");
+#endif
 
 #ifndef FIRMWARE_FLASHER_ULTRAPATCH
     /* 3. clean apply, in-flash shift mode (detools only) */
