@@ -297,8 +297,17 @@ def stream_frames(modem: Modem, items, args, noun: str):
             pct = 100.0 * (i + 1) / total
             rate = (i + 1) / (now - t0) if now > t0 else 0
             eta = (total - i - 1) / rate if rate > 0 else 0
+            eta_hours = int(eta // 3600)
+            eta_min = int((eta % 3600) // 60)
+            eta_sec = int(eta % 60)
+            eta_txt = ""
+            if eta_hours > 0:
+                eta_txt += f"{eta_hours:.0f}h"
+            if eta_min > 0:
+                eta_txt += f"{eta_min:.0f}m"
+            eta_txt += f"{eta_sec:.0f}s"
             print(f"  {i + 1}/{total} ({pct:5.1f}%)  {rate:.1f} {noun}/s  "
-                  f"retx {total_retx}  ETA {eta:.0f}s")
+                  f"retx {total_retx}  ETA {eta_txt}")
             last_report = now
     print(f"  sent {total} {noun}(s) ({total_retx} retransmission(s)).")
     return total_retx
