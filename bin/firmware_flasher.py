@@ -317,6 +317,7 @@ def send_exit_verify(modem: Modem, base: int, size: int, crc: int, args) -> bool
     if send_with_retries(modem, exit_frame, FRAME_ID_EXIT, args.baud, args.timeout,
                          args.retries, "EXIT") is not None:
         print("verify OK; watch is rebooting into the new firmware. done.")
+        copy_current_uf2(args)
         return True
     return False
 
@@ -496,6 +497,30 @@ def send_blocks(modem: Modem, send_rows, args):
               f"block {idx} (id {idx & 0xFFFF})  [{i + 1}/{total}]")
              for i, (idx, addr, row) in enumerate(send_rows)]
     return stream_frames(modem, items, args, "block")
+
+
+def copy_current_uf2(args):
+    if args.reference:
+        current = args.reference
+    else:
+        current = "current.uf2"
+    backup = os.path.splitext(current)[0] + "-bak.uf2"
+
+    moved_prev = False
+    # Back up existing current.uf2
+    if os.path.exists(current):
+        if os.path.exists(backup):
+            os.remove(backup)
+        os.rename(current, backup)
+        moved_prev = True
+
+    # Copy the contents of firmware.uf2 (follows the symlink)
+    with open(args.file, "rb") as src:
+        with open(current, "wb") as dst:
+            dst.write(src.read())
+    print(f"Copied {args.file} to {current}.")
+    if moved_prev:
+        print(f"And moved {current} to {backup}.")
 
 
 def flash_stage(modem: Modem, base, total_length, image_crc, send_rows, args,
