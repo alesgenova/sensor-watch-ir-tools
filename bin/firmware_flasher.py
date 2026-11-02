@@ -146,6 +146,19 @@ def beacon_dialect(beacon):
             FLAG_PATCH_DETOOLS: 'detools'}.get(beacon['patch_flag'])
 
 
+def time_to_text(time: float):
+    time_hours = int(time // 3600)
+    time_min = int((time % 3600) // 60)
+    time_sec = int(time % 60)
+    time_txt = ""
+    if time_hours > 0:
+        time_txt += f"{time_hours:.0f}h"
+    if time_min > 0:
+        time_txt += f"{time_min:.0f}m"
+    time_txt += f"{time_sec:.0f}s"
+    return time_txt
+
+
 def assert_flasher_face_present(image: bytes, label: str, allow_missing: bool):
     """Abort unless `image` (the assembled firmware bytes) carries the flasher
     beacon, so we never flash away the ability to re-flash."""
@@ -297,15 +310,7 @@ def stream_frames(modem: Modem, items, args, noun: str):
             pct = 100.0 * (i + 1) / total
             rate = (i + 1) / (now - t0) if now > t0 else 0
             eta = (total - i - 1) / rate if rate > 0 else 0
-            eta_hours = int(eta // 3600)
-            eta_min = int((eta % 3600) // 60)
-            eta_sec = int(eta % 60)
-            eta_txt = ""
-            if eta_hours > 0:
-                eta_txt += f"{eta_hours:.0f}h"
-            if eta_min > 0:
-                eta_txt += f"{eta_min:.0f}m"
-            eta_txt += f"{eta_sec:.0f}s"
+            eta_txt = time_to_text(eta)
             print(f"  {i + 1}/{total} ({pct:5.1f}%)  {rate:.1f} {noun}/s  "
                   f"retx {total_retx}  ETA {eta_txt}")
             last_report = now
@@ -520,6 +525,7 @@ def flash_stage(modem: Modem, base, total_length, image_crc, send_rows, args,
     from block 0 (the watch's 'id 0 = restart' rule) and so offer a resend; true
     for any flash whose send_rows start at id 0, false for a resume (which starts
     mid-stream and can't cleanly restart)."""
+    start_time = time.time()
     if arm:
         # ENTER (empty payload) drops the watch from its test stage into the RAM
         # flasher; only then is it safe to send the first block.
@@ -530,6 +536,9 @@ def flash_stage(modem: Modem, base, total_length, image_crc, send_rows, args,
         send_blocks(modem, send_rows, args)
 
         if send_exit_verify(modem, base, total_length, image_crc, args):
+            now = time.time()
+            eta_txt = time_to_text(now - start_time)
+            print(f"Flashing took {eta_txt}")
             return True
 
         print("\nNo EXIT ACK. Either the whole-image CRC did not match (the "
@@ -655,6 +664,7 @@ def patch_flash(args, base, from_size, to_size, ref_crc, new_crc, shift_size, bo
                 print("not flashing.")
                 modem.send(CMD_STOP); ser.close(); return False
 
+            start_time = time.time()
             # Patch ENTER: {base, from_size, ref_crc, to_size, shift_size}. The watch
             # ACKs ONLY if its flash over [base,base+from_size) CRCs to ref_crc, so a
             # never-arriving ACK means the watch's firmware does not match --reference
@@ -679,6 +689,9 @@ def patch_flash(args, base, from_size, to_size, ref_crc, new_crc, shift_size, bo
         # EXIT: {base, to_size, new_crc}. The watch CRCs the reconstructed image and,
         # only on a match, echoes this id and reboots into the new firmware.
         if send_exit_verify(modem, base, to_size, new_crc, args):
+            now = time.time()
+            eta_txt = time_to_text(now - start_time)
+            print(f"Flashing took {eta_txt}")
             return True
         else:
             print("\nNo EXIT ACK. Either the reconstructed image's CRC did not match "
@@ -1068,6 +1081,7 @@ def main():
         print("\ninterrupted")
         return False
     finally:
+
         modem.send(CMD_STOP)
         ser.close()
 
